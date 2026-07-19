@@ -474,7 +474,6 @@ async fn receive_benchmark(
     )
     .await?;
     stream.write_all(body.as_bytes()).await?;
-    stream.shutdown().await?;
     Ok(())
 }
 
