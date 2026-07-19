@@ -1,0 +1,548 @@
+# WinriseF 单端原生增强传输开发计划
+
+状态：架构修订版 1
+
+日期：2026-07-18
+
+Rust 基线：1.97.1
+
+Rust 仓库：`E:\Project\PROJECT\2026-Rust_Native_Transfer`
+
+网页仓库：`E:\Project\PROJECT\2025-blog-public`
+
+## 1. 本次架构纠正
+
+此前“双端都安装 Rust 客户端，再使用原生 QUIC/TCP 互传”的方案永久作废。正式产品在任何一次会话中最多且永远只有一端安装 Rust Agent，另一端只使用现有网页。即使两端都是桌面电脑，也只能选择其中一端启用 Agent，不能形成 Agent ↔ Agent 连接。
+
+正式拓扑是：
+
+```text
+安装端设备 A
+┌────────────────────────────────────────────┐
+│ 网页 A  ⇄  本机 Rust Agent                │
+│  UI/会话      文件选择、原生文件 I/O、QUIC │
+└──────────────────┬─────────────────────────┘
+                   │ WebTransport / HTTP/3 / QUIC
+                   │ 远端网页主动连接
+┌──────────────────▼─────────────────────────┐
+│ 纯网页设备 B                               │
+│ WebTransport + 浏览器 File/Storage API     │
+│ 不安装程序                                 │
+└────────────────────────────────────────────┘
+```
+
+必须始终成立的产品承诺：
+
+- 一次会话只允许其中一台设备安装和启用 Rust Agent，这不是最低要求而是产品上限。
+- 即使两端都是 Windows/Linux/macOS 电脑，也不得同时启用两个 Agent。
+- 未安装 Agent 的设备仍能通过现有网站加入会话并收发文件。
+- 两端都是手机时不使用 Agent 和 WebTransport 加速，完全沿用网页 ↔ 网页的现有 WebRTC 传输。
+- Rust 项目不提供网页、桌面窗口或其他前端；所有产品 UI 都在 `2025-blog-public`。
+- Windows Agent 只以单个便携 EXE 发布：无安装器、无服务、无托盘、无开机启动；首次双击仅在当前用户范围自注册 `winrisef://` 并打开官网结果页。
+- EXE 直接在用户选择的位置运行，不复制自身；移动或重命名后再次双击，用新路径覆盖协议注册。
+- 浏览器不能监听任意 QUIC/TCP 端口，因此纯网页端总是 WebTransport 客户端，Rust Agent 总是 WebTransport 服务端。
+- TCP/TLS 不能作为正式的浏览器端到端数据通道；原生 TCP/QUIC 只能作为性能上限诊断工具。
+- WebTransport 不可用、UDP 被阻断、局域网地址不可达或权限被拒绝时，自动保留现有 WebRTC DataChannel 路径。
+
+## 2. 项目目标
+
+### 2.1 核心目标
+
+- 在不要求远端安装程序的前提下，让安装端的大文件读写绕过浏览器内存和文件 I/O 热路径。
+- 安装端发送时由 Rust 直接读取文件并向远端网页发送，文件字节不经过网页 A。
+- 安装端接收时由 Rust 直接将远端网页的数据写入目标文件，文件字节不经过网页 A。
+- 复用现有 `/t` 局域网会话、聊天 UI、Supabase Realtime 配对和 WebRTC 控制能力。
+- WebTransport 只承担可选的高速附件数据面，现有 WebRTC 继续承担聊天、能力协商、增强通道引导和完整回退。
+- 传输 50GB 文件时，Rust Agent 与浏览器内存都保持有界，不随文件大小线性增长。
+- 极致单文件吞吐是首要目标；断点续传、多文件公平调度、跨会话恢复和历史等高级能力只能在不降低热路径吞吐、不增加明显内存压力和不扩大关键状态机的前提下加入。
+
+### 2.2 性能目标
+
+- 先用 `iperf3` 测量同方向网络上限。
+- WebTransport 内存源/汇在目标局域网达到同方向 `iperf3` 单向基线的 90% 以上，或证明已经达到浏览器/网卡的稳定上限。
+- 安装端 NVMe 文件到纯网页端可直接落盘时，完整文件吞吐达到内存传输结果的 90% 以上。
+- 纯网页端发送到安装端 NVMe 时，完整文件吞吐达到内存传输结果的 90% 以上。
+- 默认一条 WebTransport session、一个双向控制流、四条单向文件数据流。
+- Rust 默认使用 64MiB extent、4MiB I/O block、每 lane 两个复用 buffer。
+- 50GB 文件传输期间 Rust Agent 常驻内存目标低于 128MiB；网页端额外传输内存目标低于 128MiB。
+
+### 2.3 非目标
+
+第一版不实现：
+
+- 两个 Rust Agent 之间的正式原生 QUIC/TCP 协议；
+- 要求双方安装客户端；
+- 远端浏览器监听端口；
+- NAT 端口映射、互联网直连或自建 TURN；
+- 数据库、传输历史云同步或服务端文件中转；
+- 安装端独立 GUI、托盘、自动更新；
+- Rust 仓库内的网页、benchmark 前端或桌面前端；
+- 跨刷新持久断点续传；
+- 多个大文件并行占满多条独立 QUIC connection；
+- 压缩、逐块哈希、应用层逐块 ACK；
+- 用 TCP/TLS 替代 WebTransport 作为浏览器数据面。
+
+## 3. 现有网页能力与复用原则
+
+网页仓库已经包含 LAN Session V10：
+
+- `src/lib/lan-transfer/signal-client.ts`：Supabase Presence/Broadcast 信令；
+- `src/lib/lan-transfer/native-webrtc-transport.ts`：可靠有序 DataChannel；
+- `src/lib/lan-transfer/reconnect-coordinator.ts`：连接恢复状态机；
+- `src/lib/lan-transfer/connection-runtime.ts`：聊天、附件协议、进度、取消和同页恢复；
+- `src/lib/lan-transfer/attachment-send-scheduler.ts`：有界附件调度；
+- `src/lib/lan-transfer/storage/`：Memory、OPFS、IndexedDB 和直接文件写入；
+- `src/app/toolbox/use-lan-transfer-controller.ts`：页面会话和 Transport 装配入口。
+
+新方案不复制这些业务能力。增强路径只增加端口和适配器：
+
+```text
+现有会话/聊天/附件业务层
+        │
+        ├─ WebRTC Transport（所有浏览器可用，控制与回退）
+        ├─ Native Agent Control Adapter（安装端网页 ⇄ localhost Agent）
+        └─ WebTransport Bulk Adapter（纯网页 ⇄ Agent，大文件数据面）
+```
+
+WebRTC 在增强模式中仍然有价值：
+
+- 完成原有二维码配对和设备身份建立；
+- 交换 Agent capability、局域网 endpoint、证书 SHA-256 和一次性 session ticket；
+- 传输聊天、语音、小图片和低频附件控制；
+- WebTransport 建连失败时无缝回到现有附件路径。
+
+文件 payload 一旦进入增强模式，就不得绕回 WebRTC 或网页 A。
+
+## 4. 两类连接
+
+### 4.1 本机控制连接
+
+```text
+网页 A ── WebTransport(loopback) ── Rust Agent
+```
+
+职责：
+
+- Agent 发现与版本协商；
+- 系统文件选择器和保存位置选择；
+- 创建远端连接邀请；
+- 将低频控制事件、进度、完成和错误推送给网页 A；
+- 取消传输和关闭会话。
+
+启动方式：
+
+1. 网页 A 的用户点击“启动原生增强”。
+2. 网页调用 `winrisef://launch?...` 自定义协议启动 Agent。
+3. Agent 生成短期启动凭据，并打开或回调网站 HTTPS 页面。
+4. 回调信息只放在 URL fragment，包含 loopback 端口、证书 SHA-256、一次性 launch token 和过期时间。
+5. 网页 A 使用 `serverCertificateHashes` 建立 loopback WebTransport。
+6. Agent 校验 Origin、launch token、有效期和一次性使用状态。
+
+不使用固定的“跳过 TLS 校验”，也不要求用户手动信任自签名证书。
+
+### 4.2 远端数据连接
+
+```text
+纯网页 B ── WebTransport(LAN) ── Rust Agent A
+```
+
+职责：
+
+- 远端网页 B 始终主动连接；
+- Agent 监听 UDP/HTTP3，并接受经过授权的 WebTransport session；
+- 一条可靠双向控制流负责 session hello、附件元数据、接受、取消和最终确认；
+- 四条可靠单向数据流负责按 extent 发送文件数据；
+- Agent 与网页 B 都依赖流级 backpressure，不创建无限任务或无限队列。
+
+Agent endpoint 引导流程：
+
+1. 网页 A 和网页 B 先通过现有 WebRTC 建立会话。
+2. 网页 A 从本机 Agent 获取 LAN 地址、端口、证书 hash、一次性 peer ticket 和过期时间。
+3. 网页 A 通过已加密的 WebRTC DataChannel 将 Native Capability 发给网页 B。
+4. 网页 B 做 WebTransport feature detection，并在用户动作下处理可能出现的局域网权限提示。
+5. 网页 B 使用证书 hash 连接 Agent，并在第一条控制流提交 peer ticket、会话版本和绑定的设备 ID。
+6. Agent 验证成功后才允许创建文件数据流。
+
+第一版不通过公开 Supabase payload 直接发送可用 ticket；以后若必须脱离 WebRTC 引导，再单独设计端到端加密的信令扩展。
+
+## 5. 数据流
+
+### 5.1 安装端向纯网页端发送
+
+```text
+网页 A 发起选择文件
+  → Agent 打开系统文件选择器
+  → Agent 返回文件元数据，不返回文件字节
+  → 网页 A 通过现有会话发送 attachment offer
+  → 网页 B 选择浏览器存储并接受
+  → Agent positional read
+  → 4 条 WebTransport 单向流
+  → 网页 B File System Access / OPFS / IndexedDB / Memory
+  → 网页 B 最终确认
+  → Agent 通知网页 A 完成
+```
+
+### 5.2 纯网页端向安装端发送
+
+```text
+网页 B 选择 File
+  → attachment offer 到网页 A
+  → 网页 A 请求 Agent 打开系统保存对话框
+  → Agent 预分配 .part 文件并接受
+  → 网页 B 用 4MiB read cache 读取 File
+  → 4 条 WebTransport 单向流
+  → Agent positional write
+  → 长度/extent 完整性检查
+  → sync + .part 原子改名
+  → Agent 发送最终确认并通知网页 A
+```
+
+取消或失败时保留 `.part` 仅限未来恢复阶段；第一版默认删除未完成临时文件，且必须明确记录这一产品行为。
+
+## 6. 协议原则
+
+### 6.1 版本
+
+- Native Agent bridge protocol 与 bulk transfer protocol 分别具有独立 major version。
+- major 不一致直接拒绝并提示刷新网页或升级 Agent，不维护复杂兼容分支。
+- 现有 LAN Session V10 的升级由网页仓库单独决定；不要把 Rust crate 版本当作网页协议版本。
+
+### 6.2 控制面
+
+低频控制消息允许使用严格 schema 的 JSON，便于 Rust 与 TypeScript 调试和演进。每条消息必须包含：
+
+- `protocolVersion`；
+- `id` 或 `requestId`；
+- `sessionId`；
+- `type`；
+- 与 peer/attachment 相关时包含对应稳定 ID。
+
+控制消息需要限制最大长度、拒绝未知 major、拒绝越权 attachment ID。JSON 不得出现在文件块热路径。
+
+### 6.3 数据面
+
+文件数据使用固定二进制 header：
+
+- stream header：magic、协议版本、session ID 摘要、attachment ID、lane ID、lane count、总大小；
+- extent header：offset、length、flags；
+- payload：原始文件字节；
+- lane 结束使用 stream FIN，不为每个 block 发送 JSON 或 ACK。
+
+默认调度：
+
+```text
+laneCount  = 4
+extentSize = 64 MiB
+ioBlock    = 4 MiB
+pool       = 每 lane 2 buffers
+```
+
+每个发送 lane 使用原子 `fetch_add(64MiB)` 领取 extent，在 extent 内连续读写 4MiB block。接收端按 offset 写入，因此不同 lane 的到达顺序不影响文件布局。
+
+第一版一次只允许一个增强大文件处于 active data 状态；其他附件留在现有调度队列。完成单文件正确性和吞吐后再加入多文件公平调度。
+
+## 7. 安全模型
+
+### 7.1 TLS 与证书
+
+- WebTransport 只能运行在安全上下文，TLS 校验失败不可通过浏览器警告页绕过。
+- Agent 使用 P-256 短期自签名证书，证书有效期不得超过 WebTransport certificate-hash 机制允许的两周；项目默认每次 Agent 启动生成并使用不超过 13 天的证书。
+- 网页通过 `serverCertificateHashes` 校验精确的 SHA-256 DER 证书摘要。
+- 本机 hash 通过自定义协议启动回调的 URL fragment 交付；远端 hash 通过已经建立的 WebRTC 加密通道交付。
+- 不在 localStorage 长期保存私钥、launch token 或 peer ticket。
+
+### 7.2 Agent 鉴权
+
+- Agent 必须校验 HTTPS 页面的精确 Origin allowlist。
+- launch token 和 peer ticket 至少 128 bit 随机、短期、一次性使用。
+- peer ticket 必须绑定 session ID、目标 device ID、允许的操作和过期时间。
+- 未鉴权 session 只能提交 hello，不能打开数据流或访问文件。
+- Agent 不接受网页传入任意文件系统路径；文件由系统选择器返回句柄，或由 Agent 内部生成受控临时路径。
+- 日志禁止记录完整 token、证书私钥、文件内容、完整局域网地址或用户绝对路径。
+
+### 7.3 网络边界
+
+- WebTransport 没有 ICE/STUN NAT 穿透能力，本阶段只承诺同一局域网可达地址。
+- UDP、系统防火墙、不同地址族或浏览器 Local Network Access 权限都可能阻断增强通道。
+- 所有失败必须分类为“浏览器不支持、权限拒绝、Agent 不可达、TLS/hash、鉴权、协议、文件 I/O、超时”，随后允许 WebRTC 回退。
+
+## 8. Rust 工程结构
+
+采用精简的 Clean/Hexagonal 边界，避免让业务核心依赖 Tokio、WebTransport 或平台 API：
+
+```text
+2026-Rust_Native_Transfer/
+├─ Cargo.toml
+├─ rust-toolchain.toml
+├─ plan.md
+├─ agent.md
+├─ crates/
+│  ├─ winrisef-core/
+│  │  └─ src/
+│  │     ├─ domain/          # session、attachment、状态和值对象
+│  │     ├─ protocol/        # 控制 schema、二进制 header、版本
+│  │     ├─ scheduler/       # extent、lane、buffer 规则
+│  │     └─ ports/           # transport、file source/sink、events、clock
+│  └─ winrisef-agent/
+│     └─ src/
+│        ├─ application/     # 用例编排，不直接解析 socket 字节
+│        ├─ adapters/
+│        │  ├─ webtransport/ # loopback 与 LAN session
+│        │  ├─ file_io/      # 平台 positional I/O 常驻线程
+│        │  ├─ file_picker/  # 系统文件选择器
+│        │  ├─ launch/       # 自定义协议与浏览器回调
+│        │  └─ telemetry/    # 本地每秒性能统计
+│        ├─ config.rs
+│        ├─ bootstrap.rs
+│        └─ main.rs
+└─ tests/                    # 协议、调度、假适配器与互操作测试
+```
+
+依赖方向：
+
+```text
+winrisef-agent adapters → application → winrisef-core
+```
+
+`winrisef-core` 禁止依赖 `tokio`、`quinn`、WebTransport crate、`rfd`、`sysinfo` 或操作系统模块。核心用例通过 ports 接口调用外部能力，单元测试使用 memory/fake adapters。
+
+## 9. 网页工程结构调整
+
+在不破坏现有 WebRTC 代码的前提下，计划新增：
+
+```text
+2025-blog-public/src/lib/lan-transfer/
+├─ native-agent/
+│  ├─ capability.ts         # feature detection 与 Agent 状态
+│  ├─ launch-client.ts      # 自定义协议启动与 fragment 消费
+│  ├─ local-bridge.ts       # 网页 A ⇄ Agent
+│  ├─ peer-webtransport.ts  # 网页 B ⇄ Agent
+│  ├─ protocol.ts           # 控制 schema 与二进制 header
+│  └─ bulk-transfer.ts      # 浏览器端流、backpressure 和 storage 接入
+└─ ...现有 V10 模块
+```
+
+需要扩展而不是复制的现有边界：
+
+- `LanCapability`：加入可选 WebTransport 和 Native Agent capability；
+- `LanConnectionRuntime`：允许附件选择 `webrtc` 或 `native-webtransport` 数据面；
+- `LanAttachmentSendScheduler`：增强文件交给 bulk adapter 后不再写 DataChannel frame；
+- `LanStorageEngine`：继续作为纯网页 B 的接收存储端口；
+- `use-lan-transfer-controller.ts`：装配 Agent 状态，但不承载协议细节；
+- `ARCHITECTURE.md`：实现网页改动时同步更新正式说明。
+
+不要直接把 WebTransport 分支堆入 `native-webrtc-transport.ts`。
+
+## 10. 推荐依赖方向
+
+最终版本以当时锁文件和编译结果为准，第一轮候选：
+
+- Runtime：`tokio`；
+- WebTransport/HTTP3：优先评估 `web-transport-quinn`，封装在 adapter 后；
+- QUIC/TLS 底层：`quinn`、`rustls`；
+- 短期证书：`rcgen`；
+- 固定 buffer：`bytes` 或自有 buffer pool；
+- socket 调优：`socket2`；
+- 错误：`thiserror`，仅进程边界可使用 `anyhow`；
+- 控制消息：`serde`、`serde_json`，只用于低频控制面；
+- 随机和摘要：`rand`、`sha2`、必要时 `hkdf`/`hmac`；
+- 文件选择：`rfd`；
+- 本地观测：`tracing`、`sysinfo`；
+- 文件预分配：标准库能力或经过跨平台验证的轻量 crate。
+
+不在首版加入数据库、ORM、Web 框架全家桶、嵌入式浏览器、自动更新框架或远程遥测 SDK。
+
+## 11. 实施阶段
+
+### Phase 0（第一阶段）：无前端 WebTransport 高速内核
+
+目标：先完成可供现有网页连接的无前端 Rust 高速内核。该阶段不在 Rust 仓库创建网页客户端，也不实现 Agent ↔ Agent；浏览器互操作和实测在接入现有网页后完成。
+
+任务：
+
+1. 审核并删除/重写当前由错误双原生方案产生的临时 scaffold；不得补完双 Rust CLI。
+2. 按第 8 节建立 `winrisef-core` 与 `winrisef-agent`。
+3. Agent 创建短期证书并启动浏览器可连接的 WebTransport server。
+4. 实现受限的 session hello 和 benchmark-only 鉴权入口，为现有网页 adapter 固定协议契约。
+5. 完成 memory source/sink 的 Agent 侧双向引擎；测试大小只作为计数，不分配等量内存。
+6. 实现一条 session、一个控制流和四条单向数据流。
+7. 实现 4MiB buffer pool、64MiB extent 调度和有界 backpressure。
+8. 实现固定二进制 stream/extent header，热路径无 JSON。
+9. 输出 elapsed、bytes、current/average Mbps、CPU、RSS 和错误分类。
+10. 提供协议 fixture 和 core 假适配器测试，不提供网页或桌面 UI。
+
+完成门槛：
+
+- Rust 侧双向内存传输状态机和协议 fixture 正确；
+- 传输大小与计数完全一致；
+- 无无限队列，内存不随测试大小增长；
+- `cargo check`、Clippy 和测试构建验证通过；
+- 不启动 Agent 或 benchmark 完成静态交付；浏览器互操作与 `iperf3` 性能门在 Phase 2 接入现有网页后执行。
+
+### Phase 1：本机 Agent 启动与安全 Bridge
+
+目标：网页 A 可以安全发现并控制本机 Agent，不承载文件 payload。
+
+任务：
+
+1. 实现便携 EXE 无参数双击自注册 `winrisef://`，成功或失败后打开官网结果页；
+2. 实现启动回调 fragment；
+3. 实现一次性 launch token；
+4. 实现 loopback WebTransport bridge；
+5. 实现 Origin allowlist、版本握手和 capability；
+6. 实现 `select_files`、`select_destination`、`create_peer_ticket`、`cancel_transfer`；
+7. 推送 Agent 状态、进度、完成和错误事件；
+8. Agent 无独立 GUI，只允许系统文件对话框。
+
+完成门槛：网页不能凭猜测端口控制 Agent；token 重放、错误 Origin、过期 token 和版本不一致全部被拒绝。
+
+### Phase 2：远端网页连接 Agent
+
+目标：网页 B 不安装程序即可安全建立 Agent 数据连接。
+
+任务：
+
+1. 扩展网页 capability，检测 WebTransport；
+2. 网页 A 通过现有 WebRTC 发送 Native Agent offer；
+3. 网页 B 使用 endpoint、hash 和 peer ticket 建连；
+4. Agent 校验 WebTransport Origin 与 in-band ticket；
+5. UI 显示“原生增强连接中/已启用/已回退”；
+6. 处理 Local Network Access 权限、UDP/防火墙和地址族错误；
+7. 失败保持现有 WebRTC 会话，不销毁聊天 Runtime。
+8. 在现有网页中加入仅开发环境可见的内存源/汇性能入口，不在 Rust 仓库创建前端。
+
+完成门槛：增强连接失败不会影响文字聊天或普通 WebRTC 文件传输；目标设备连续五轮 WebTransport 内存测试中位数达到同方向 `iperf3` 的 90%，相对中位数波动不超过 5%。
+
+### Phase 3：安装端发送大文件
+
+目标：Rust 直接从磁盘向网页 B 发送。
+
+任务：
+
+1. 系统文件选择器只返回元数据到网页 A；
+2. 文件由常驻专用 I/O 线程打开一次并按 offset 读取；
+3. 四 lane 领取 64MiB extents；
+4. 每 lane 使用两个 4MiB pooled buffers；
+5. 网页 B 接入现有 StorageEngine；
+6. 最终验证 total bytes、extent coverage 和文件长度；
+7. 完成、拒绝、取消和失败映射到现有附件卡状态。
+
+完成门槛：文件 payload 不出现在网页 A 的 JS heap；50GB 文件 Rust 内存保持有界。
+
+### Phase 4：安装端接收大文件
+
+目标：网页 B 直接向 Rust 发送并由 Rust 落盘。
+
+任务：
+
+1. 网页 B 以 4MiB read cache 读取 File；
+2. Rust 打开系统保存对话框；
+3. 目标 `.part` 文件预分配；
+4. 四个常驻 writer 按 offset 写入；
+5. 完成后 flush/sync、长度检查和原子改名；
+6. 失败与取消遵循明确的 `.part` 清理策略；
+7. 最终确认后更新双方附件状态。
+
+完成门槛：网页 A 不接触文件 payload，目标文件字节与源文件一致。
+
+### Phase 5：可靠性、回退和网页正式集成
+
+目标：增强路径成为现有 LAN Session 的可选数据面，而不是第二套产品。
+
+任务：
+
+1. 将已经在 `2025-blog-public` 开发入口验证过的 adapter 接入正式 LAN UI；
+2. 保留一个聊天 Runtime 和一份附件状态；
+3. 传输开始前可回退 WebRTC；已开始的增强传输失败时第一版明确失败并允许用户重试；
+4. 后续再加入 extent checkpoint 和同页恢复；
+5. 网页 feature flag 分阶段启用；
+6. 更新网页仓库 `ARCHITECTURE.md`；
+7. 删除不再使用的实验代码，不保留双协议兼容泥层。
+
+### Phase 6：跨平台、打包与发布
+
+任务：
+
+1. Windows 单文件便携发布、自注册协议、防火墙与删除前撤销注册说明；
+2. Linux deb/AppImage 与协议注册；
+3. macOS 签名、公证、文件与网络权限；
+4. Rust 构建矩阵和网页协议兼容矩阵；
+5. Agent 版本过旧提示；
+6. 下载页和原生增强开关；
+7. 默认仍允许纯网页 WebRTC 模式。
+
+## 12. 验证矩阵
+
+每个方向分别测试：
+
+| 编号 | 发送端 | 接收端 | 目的 |
+|---|---|---|---|
+| B0 | Agent memory | Browser discard | Agent → Browser 网络上限 |
+| B1 | Browser memory | Agent discard | Browser → Agent 网络上限 |
+| B2 | Agent file | Browser discard | 安装端读盘影响 |
+| B3 | Agent memory | Browser storage | 浏览器写盘影响 |
+| B4 | Browser File | Agent discard | 浏览器读盘影响 |
+| B5 | Browser memory | Agent file | 安装端写盘影响 |
+| B6 | Agent file | Browser storage | 完整安装端发送 |
+| B7 | Browser File | Agent file | 完整安装端接收 |
+| F0 | Browser WebRTC | Browser WebRTC | 现有回退基线 |
+
+网络场景：
+
+- 千兆有线 LAN；
+- Wi-Fi 同 AP；
+- IPv4；
+- IPv6；
+- UDP 被防火墙阻断；
+- WebTransport 不支持；
+- Local Network Access 权限允许/拒绝；
+- Agent 运行/未运行/版本不匹配。
+
+文件规模：1MiB、64MiB、1GiB、10GiB、50GiB。内存基准不得一次分配测试总大小。
+
+## 13. 性能规则
+
+1. 文件热路径不使用 JSON。
+2. 不为每个 block 创建 Tokio task、线程、channel 或 `Vec`。
+3. 不在每个 block 上调用 `tokio::fs` 或 `spawn_blocking`。
+4. 文件线程在传输期间长期存在；文件一次打开，任务结束才关闭。
+5. 所有网络与文件队列有明确容量。
+6. 默认 4 lane，不盲目增加到几十条流。
+7. 目标文件在接收数据前预分配。
+8. 不为每块计算应用层哈希或输出日志。
+9. 性能统计最多每秒更新一次，UI 进度最多每 250ms 合并一次。
+10. 性能测试使用 release 构建，并记录浏览器、系统、网卡、磁盘、连接类型和 `iperf3` 同方向结果。
+
+## 14. 决策门
+
+- WebTransport 是本架构中浏览器与 Agent 的唯一原生高速候选，不再进行“QUIC 对 TCP/TLS，胜者进入生产”的错误选型。
+- 任何会话都不能出现两个 Agent；检测到远端也报告 Agent 时，不协商 Agent ↔ Agent，而是仅保留一端 Agent 或退回网页模式。
+- 两端均为手机时固定使用现有 WebRTC，原生项目不参与。
+- 高级功能默认不进入热路径；只有 benchmark 证明吞吐、CPU、内存和复杂度没有实质退化时才允许加入。
+- 不开发安装器、托盘、后台服务或开机启动；发布能力只围绕单文件 EXE、代码签名、下载校验和当前用户协议注册展开。
+- B0/B1 满速而 B6/B7 慢：优化文件 I/O 或浏览器存储，不改网络协议。
+- B0/B1 本身慢：检查浏览器实现、QUIC window、UDP buffer、CPU 和网卡，再决定是否维持 WebRTC-only 产品。
+- WebTransport 兼容性不足时，增强模式只对通过 capability probe 的浏览器开放；不能牺牲现有纯网页路径。
+
+## 15. 当前仓库状态说明
+
+错误的 `crates/winrisef-transfer` 双原生 scaffold 已在 2026-07-18 删除并重建为：
+
+- `winrisef-core`：协议、extent、coverage 和固定 buffer pool；
+- `winrisef-agent`：无前端 WebTransport server、短期证书、鉴权和双向 memory engine；
+- `docs/protocol-v1.md`：供现有网页后续实现 adapter 的固定跨语言协议。
+
+第一阶段代码已经完成格式化、workspace check、Clippy `-D warnings` 和测试构建验证，没有启动 Agent、执行测试用例或运行传输。真实浏览器互操作、吞吐与 `iperf3` 门槛仍处于未验证状态，必须在 Phase 2 修改现有网页后完成。
+
+2026-07-18 已补齐第一个可由用户手工执行的浏览器互操作闭环：Windows `winrisef://` 当前用户注册、可信 Origin 白名单、HTTPS fragment 回调、一次性 launch token、持久 Local Bridge、一次性 peer ticket、现有 WebRTC ticket 请求/响应，以及远端纯网页四 lane 双向内存测速入口。Agent 仍无 GUI，安装端网页仍不承载 benchmark payload，双方同时发布 Agent 时按 device ID 只保留一端。该闭环尚未由 Codex 启动或测试，吞吐、浏览器兼容性、防火墙行为和 `iperf3` 90% 门槛由用户下一步手工验证；真实文件选择和磁盘 I/O 尚未进入实现。
+
+2026-07-19 首次手工互操作已确认网页可以通过 `winrisef://` 启动 Agent、打开 HTTPS 回调页并将凭据交还主页面，但 Chrome 在连接 `127.0.0.1:17691` 的本机 Bridge 时报告 `ERR_QUIC_PROTOCOL_ERROR` / `Opening handshake failed`。排障阶段临时启用每进程全局 trace 日志，固定保存至用户 Documents 的 `WinriseF-Agent-Logs`；同时以显式 Quinn Incoming → TLS → HTTP/3 → WebTransport CONNECT 接受链替换会吞掉握手错误的 server 包装。定位并修复根因后必须降低日志级别并移除非必要诊断噪声。
+
+## 16. 参考依据
+
+- WebTransport W3C Working Draft：`https://www.w3.org/TR/webtransport/`
+- MDN WebTransport API：`https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API`
+- Chrome Local Network Access：`https://developer.chrome.com/blog/local-network-access`
+- `web-transport-quinn` 文档：`https://docs.rs/web-transport-quinn/latest/web_transport_quinn/`
+- `wtransport` 文档：`https://docs.rs/wtransport/latest/wtransport/`
+- Quinn 文档：`https://docs.rs/quinn/latest/quinn/`
