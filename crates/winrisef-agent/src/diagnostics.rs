@@ -40,6 +40,9 @@ impl Write for TeeWriter {
             .lock()
             .map_err(|_| io::Error::other("diagnostic log lock is poisoned"))?;
         file.write_all(bytes)?;
+        if bytes.contains(&b'\n') {
+            file.flush()?;
+        }
         if let Some(stderr) = &mut self.stderr {
             stderr.write_all(bytes)?;
         }

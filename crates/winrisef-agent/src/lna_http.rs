@@ -385,6 +385,14 @@ async fn route_request(
     }
     let _permit = permit;
 
+    tracing::info!(
+        %remote,
+        method = %request.method,
+        bytes = request_bytes,
+        keep_alive = request.keep_alive,
+        "LNA HTTP benchmark request accepted"
+    );
+
     if request.method == "POST" {
         receive_benchmark(
             stream,
