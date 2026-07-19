@@ -4,11 +4,12 @@ use std::sync::{
 };
 
 use anyhow::Context;
+use bytes::Bytes;
 use tokio::task::JoinSet;
 use web_transport_quinn::{RecvStream, SendStream, Session};
 use winrisef_core::{
-    AckStatus, BufferPool, CoverageTracker, ExtentHeader, ExtentScheduler, Hello, HelloAck,
-    LaneHeader, TransferDirection, TransferResult,
+    AckStatus, CoverageTracker, ExtentHeader, Hello, HelloAck, LaneHeader, TransferDirection,
+    TransferResult,
     protocol::{EXTENT_HEADER_LEN, HELLO_LEN, LANE_HEADER_LEN},
 };
 
@@ -19,8 +20,7 @@ use crate::{
 
 pub const LANE_COUNT: usize = 4;
 pub const BLOCK_SIZE: usize = 4 * 1024 * 1024;
-pub const EXTENT_SIZE: u64 = 64 * 1024 * 1024;
-const BUFFERS_PER_LANE: usize = 2;
+pub const EXTENT_SIZE: u64 = 16 * 1024 * 1024;
 const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone)]
@@ -93,14 +93,6 @@ pub async fn run_session(
     send_ack(&mut control_send, hello, AckStatus::Accepted).await?;
     tracing::info!("transfer configuration accepted");
 
-    let pool = BufferPool::new(LANE_COUNT * BUFFERS_PER_LANE, BLOCK_SIZE)
-        .context("failed to allocate the bounded buffer pool")?;
-    tracing::debug!(
-        buffer_count = LANE_COUNT * BUFFERS_PER_LANE,
-        buffer_size = BLOCK_SIZE,
-        bounded_pool_bytes = LANE_COUNT * BUFFERS_PER_LANE * BLOCK_SIZE,
-        "allocated bounded transfer buffer pool"
-    );
     let direction = match hello.direction {
         TransferDirection::BrowserToAgentMemory => "browser-to-agent-memory",
         TransferDirection::AgentToBrowserMemory => "agent-to-browser-memory",
@@ -110,16 +102,17 @@ pub async fn run_session(
 
     let outcome = match hello.direction {
         TransferDirection::BrowserToAgentMemory => {
-            receive_memory(&session, hello, pool, Arc::clone(&progress)).await
+            receive_memory(&session, hello, Arc::clone(&progress)).await
         }
         TransferDirection::AgentToBrowserMemory => {
-            send_memory(&session, hello, pool, Arc::clone(&progress)).await
+            send_memory(&session, hello, Arc::clone(&progress)).await
         }
     };
     if let Err(error) = &outcome {
         tracing::error!(error = ?error, "memory payload phase failed");
     }
     let stats = monitor.finish().await;
+    log_quic_summary(&session, direction);
     let status = if outcome.is_ok() {
         AckStatus::Accepted
     } else {
@@ -155,10 +148,46 @@ pub async fn run_session(
     }
     outcome?;
     tracing::info!(
+        direction,
+        lanes = LANE_COUNT,
         bytes = stats.bytes,
+        elapsed_ms = stats.elapsed.as_secs_f64() * 1000.0,
+        average_mbps = stats.average_mbps,
         "memory transfer session completed successfully"
     );
     Ok(stats)
+}
+
+fn log_quic_summary(session: &Session, direction: &'static str) {
+    let stats = quinn::Connection::stats(session);
+    tracing::info!(
+        direction,
+        rtt_ms = stats.path.rtt.as_secs_f64() * 1000.0,
+        congestion_window_bytes = stats.path.cwnd,
+        congestion_events = stats.path.congestion_events,
+        lost_packets = stats.path.lost_packets,
+        lost_bytes = stats.path.lost_bytes,
+        sent_packets = stats.path.sent_packets,
+        current_mtu = stats.path.current_mtu,
+        black_holes_detected = stats.path.black_holes_detected,
+        udp_tx_datagrams = stats.udp_tx.datagrams,
+        udp_tx_bytes = stats.udp_tx.bytes,
+        udp_tx_ios = stats.udp_tx.ios,
+        udp_rx_datagrams = stats.udp_rx.datagrams,
+        udp_rx_bytes = stats.udp_rx.bytes,
+        udp_rx_ios = stats.udp_rx.ios,
+        tx_data_blocked = stats.frame_tx.data_blocked,
+        tx_stream_data_blocked = stats.frame_tx.stream_data_blocked,
+        tx_streams_blocked_uni = stats.frame_tx.streams_blocked_uni,
+        tx_max_data = stats.frame_tx.max_data,
+        tx_max_stream_data = stats.frame_tx.max_stream_data,
+        rx_data_blocked = stats.frame_rx.data_blocked,
+        rx_stream_data_blocked = stats.frame_rx.stream_data_blocked,
+        rx_streams_blocked_uni = stats.frame_rx.streams_blocked_uni,
+        rx_max_data = stats.frame_rx.max_data,
+        rx_max_stream_data = stats.frame_rx.max_stream_data,
+        "QUIC payload path summary"
+    );
 }
 
 async fn read_hello(recv: &mut RecvStream) -> anyhow::Result<Hello> {
@@ -192,18 +221,20 @@ fn valid_configuration(hello: Hello, max_transfer_size: u64) -> bool {
 async fn send_memory(
     session: &Session,
     hello: Hello,
-    pool: BufferPool,
     progress: Arc<Progress>,
 ) -> anyhow::Result<()> {
-    let scheduler = Arc::new(ExtentScheduler::new(hello.total_size, EXTENT_SIZE)?);
+    let zero_block = Bytes::from(vec![0; BLOCK_SIZE]);
+    tracing::debug!(
+        shared_zero_block_bytes = zero_block.len(),
+        "allocated zero-copy benchmark payload"
+    );
     let mut lanes = JoinSet::new();
     for lane_id in 0..LANE_COUNT {
         lanes.spawn(send_lane(
             session.clone(),
             lane_id as u16,
             hello,
-            Arc::clone(&scheduler),
-            pool.clone(),
+            zero_block.clone(),
             Arc::clone(&progress),
         ));
     }
@@ -221,8 +252,7 @@ async fn send_lane(
     session: Session,
     lane_id: u16,
     hello: Hello,
-    scheduler: Arc<ExtentScheduler>,
-    pool: BufferPool,
+    zero_block: Bytes,
     progress: Arc<Progress>,
 ) -> anyhow::Result<()> {
     tracing::debug!(lane_id, "Agent-to-browser lane started");
@@ -240,7 +270,8 @@ async fn send_lane(
         .await
         .context("failed to write a lane header")?;
 
-    while let Some(extent) = scheduler.next() {
+    let mut extent_index = 0_u64;
+    while let Some(extent) = lane_extent(lane_id, extent_index, hello.total_size) {
         send.write_all(
             &ExtentHeader {
                 offset: extent.offset,
@@ -255,14 +286,13 @@ async fn send_lane(
         while remaining > 0 {
             let chunk_len = usize::try_from(remaining.min(BLOCK_SIZE as u64))
                 .expect("chunk length is bounded by BLOCK_SIZE");
-            let mut buffer = pool.acquire().context("buffer pool invariant failed")?;
-            buffer.set_len(chunk_len)?;
-            send.write_all(&buffer)
+            send.write_chunk(zero_block.slice(..chunk_len))
                 .await
-                .context("failed to write memory payload")?;
+                .context("failed to queue zero-copy memory payload")?;
             progress.add(chunk_len);
             remaining -= chunk_len as u64;
         }
+        extent_index += 1;
     }
 
     send.write_all(&ExtentHeader::END.encode())
@@ -282,10 +312,23 @@ async fn send_lane(
     }
 }
 
+fn lane_extent(lane_id: u16, extent_index: u64, total_size: u64) -> Option<ExtentHeader> {
+    let extent_number = extent_index
+        .checked_mul(LANE_COUNT as u64)?
+        .checked_add(u64::from(lane_id))?;
+    let offset = extent_number.checked_mul(EXTENT_SIZE)?;
+    if offset >= total_size {
+        return None;
+    }
+    Some(ExtentHeader {
+        offset,
+        len: EXTENT_SIZE.min(total_size - offset),
+    })
+}
+
 async fn receive_memory(
     session: &Session,
     hello: Hello,
-    pool: BufferPool,
     progress: Arc<Progress>,
 ) -> anyhow::Result<()> {
     let coverage = Arc::new(CoverageTracker::new(hello.total_size, EXTENT_SIZE)?);
@@ -299,7 +342,6 @@ async fn receive_memory(
         lanes.spawn(receive_lane(
             recv,
             hello,
-            pool.clone(),
             Arc::clone(&coverage),
             Arc::clone(&seen_lanes),
             Arc::clone(&progress),
@@ -327,7 +369,6 @@ async fn receive_memory(
 async fn receive_lane(
     mut recv: RecvStream,
     hello: Hello,
-    pool: BufferPool,
     coverage: Arc<CoverageTracker>,
     seen_lanes: Arc<AtomicU64>,
     progress: Arc<Progress>,
@@ -367,13 +408,15 @@ async fn receive_lane(
 
         let mut remaining = extent.len;
         while remaining > 0 {
-            let chunk_len = usize::try_from(remaining.min(BLOCK_SIZE as u64))
+            let max_chunk_len = usize::try_from(remaining.min(BLOCK_SIZE as u64))
                 .expect("chunk length is bounded by BLOCK_SIZE");
-            let mut buffer = pool.acquire().context("buffer pool invariant failed")?;
-            buffer.set_len(chunk_len)?;
-            recv.read_exact(&mut buffer)
+            let chunk = recv
+                .read_chunk(max_chunk_len, true)
                 .await
-                .context("failed to read memory payload")?;
+                .context("failed to read zero-copy memory payload")?
+                .context("data stream ended inside a declared extent")?;
+            let chunk_len = chunk.bytes.len();
+            anyhow::ensure!(chunk_len > 0, "received an empty memory payload chunk");
             progress.add(chunk_len);
             remaining -= chunk_len as u64;
         }
@@ -390,7 +433,7 @@ async fn receive_lane(
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCK_SIZE, EXTENT_SIZE, valid_configuration};
+    use super::{BLOCK_SIZE, EXTENT_SIZE, LANE_COUNT, lane_extent, valid_configuration};
     use winrisef_core::{Hello, TransferDirection};
 
     fn hello() -> Hello {
@@ -410,5 +453,21 @@ mod tests {
         let mut wrong = hello();
         wrong.lanes = 2;
         assert!(!valid_configuration(wrong, 2048));
+    }
+
+    #[test]
+    fn sixty_four_mib_uses_all_four_lanes() {
+        let total_size = 64 * 1024 * 1024;
+        let mut extents = (0..LANE_COUNT)
+            .map(|lane_id| lane_extent(lane_id as u16, 0, total_size).unwrap())
+            .collect::<Vec<_>>();
+        extents.sort_unstable_by_key(|extent| extent.offset);
+
+        assert_eq!(extents.len(), LANE_COUNT);
+        for (index, extent) in extents.into_iter().enumerate() {
+            assert_eq!(extent.offset, index as u64 * EXTENT_SIZE);
+            assert_eq!(extent.len, EXTENT_SIZE);
+            assert!(lane_extent(index as u16, 1, total_size).is_none());
+        }
     }
 }

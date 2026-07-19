@@ -14,7 +14,7 @@ use crate::{
 };
 
 pub const BRIDGE_PATH: &str = "/winrisef/bridge/v1";
-pub const BENCHMARK_PATH: &str = "/winrisef/benchmark/v1";
+pub const BENCHMARK_PATH: &str = "/winrisef/benchmark/v3";
 
 pub struct LaunchedServerSettings {
     pub listen: std::net::SocketAddr,

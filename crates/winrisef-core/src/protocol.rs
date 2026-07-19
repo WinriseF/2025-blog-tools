@@ -1,4 +1,4 @@
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const HELLO_LEN: usize = 48;
 pub const ACK_LEN: usize = 32;
 pub const LANE_HEADER_LEN: usize = 32;

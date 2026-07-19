@@ -343,6 +343,8 @@ BUFFERS_PER_LANE = 2
 
 浏览器可以把 4MiB I/O cache 分成更小的 stream writer 写入，但 extent 和文件 offset 语义不得改变。
 
+以上 `EXTENT_SIZE` 是正式文件数据面常量。memory benchmark v3 默认把逻辑总量拆到六条独立 QUIC connection，每条 connection 单独使用 16MiB stripe 并按 lane ID 确定性分配；不得把测速 stripe 反向写入正式文件协议。
+
 ## 10. 文件 I/O 规则
 
 ### 10.1 安装端读取
@@ -510,9 +512,9 @@ unbounded channel
 
 - `winrisef-core`：不依赖 Tokio/Quinn 的协议与调度核心；
 - `winrisef-agent`：唯一的无前端 Agent server；
-- `docs/protocol-v1.md`：现有网页后续接入时的 Phase-0 协议契约。
+- `docs/protocol-v3.md`：当前网页与 Agent 的六路并行 memory benchmark 协议契约。
 
-当前实现包含 WebTransport server、memory source/sink、Windows `winrisef://` 启动、可信 Origin 注册、与本机 Bridge 绑定的 Agent 生命周期、一次性 Local Bridge/peer ticket，以及现有网页中的远端双向内存测速入口；仍不包含 Rust client、TCP/TLS transport 或真实文件 I/O。不要重新创建双原生 sender/receiver。真实浏览器互操作尚未运行，不能把代码完成描述为性能达标。
+当前实现包含 WebTransport server、六条独立 QUIC connection 聚合 memory benchmark、每 connection 四 lane、Rust 双向零拷贝 payload、BBR LAN cold-start tuning、Windows `winrisef://` 启动、可信 Origin 注册、与本机 Bridge 绑定的 Agent 生命周期、每 connection 一张的一次性 Local Bridge/peer ticket，以及现有网页中的远端双向内存测速入口；仍不包含 Rust client、TCP/TLS transport 或真实文件 I/O。不要重新创建双原生 sender/receiver。v3 尚未由用户复测，不能把编译完成描述为性能达标。
 
 ## 18. Definition of Done
 

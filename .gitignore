@@ -1,4 +1,4 @@
 /target/
+/.firecrawl/
 *.part
 *.p0-output
-

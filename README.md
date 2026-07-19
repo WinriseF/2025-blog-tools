@@ -18,8 +18,8 @@ WinriseF Native Transfer 是与现有 `2025-blog-public` 协同工作的无前�
 
 当前已经形成“单 Agent + 远端纯网页”的双向内存测速闭环：
 
-- `winrisef-core`：固定二进制协议、64MiB extent 调度、覆盖检查、4MiB buffer pool；
-- `winrisef-agent`：WebTransport/HTTP3 服务端、13 天以内 P-256 临时证书、Origin/token 鉴权、双向内存源/汇、四条单向数据流和每秒一次本地指标；
+- `winrisef-core`：固定二进制协议、16MiB memory-benchmark stripe、覆盖检查和正式文件阶段可复用的固定 buffer pool；
+- `winrisef-agent`：WebTransport/HTTP3 服务端、13 天以内 P-256 临时证书、Origin/token 鉴权、四条单向数据流、零拷贝测速 payload 和可选低频本地指标；
 - `winrisef://`：Windows 当前用户协议注册、网页启动回调和一次性 launch token；
 - Local Bridge：安装端网页只负责签发短期 peer ticket，不承载测速 payload；
 - 远端网页：通过现有 WebRTC 获取一次性 ticket 后，直接连接 Agent 做 browser→Agent 和 Agent→browser 测速。
@@ -33,15 +33,16 @@ E:\Project\PROJECT\2025-blog-public
 ## 固定热路径参数
 
 ```text
-WebTransport sessions = 有界，默认 1
-data lanes            = 4
-extent size           = 64 MiB
+WebTransport sessions = 6 条独立 QUIC connection（有界，可配置 1–8）
+data lanes            = 每 connection 4 条，默认最多 24 条
+benchmark stripe      = 每 connection 16 MiB（1GiB 测试使用全部 24 lanes）
 I/O block             = 4 MiB
-buffers per lane      = 2
-Agent buffer pool     = 32 MiB
+browser writes/lane   = 每 connection 每 lane 2 in flight（有界）
+Agent benchmark data  = 每 connection 4 MiB immutable Bytes，默认 24 MiB
+QUIC congestion       = BBR，1 MiB initial cwnd，10 ms initial RTT
 ```
 
-网络流内不使用 JSON、逐块哈希、逐块 ACK 或逐块日志。协议见 [docs/protocol-v1.md](docs/protocol-v1.md)。
+逻辑测速将总量拆到六条独立 WebTransport/QUIC connection，以六路最晚完成时间计算聚合吞吐；每条 connection 内仍使用四 lane。Agent→browser 通过 Quinn `Bytes` 所有权直接排入发送队列，不再复制整段测速数据；browser→Agent 通过 ordered `read_chunk` 直接计数并丢弃。网络流内不使用 JSON、逐块哈希、逐块 ACK 或逐块日志。测速协议见 [docs/protocol-v3.md](docs/protocol-v3.md)。正式文件数据面仍计划使用 64MiB extent。
 
 ## 首次使用与手工测试
 
@@ -77,15 +78,17 @@ cargo build -p winrisef-agent
 
 Agent 与已认证的本机 Bridge 同生命周期：关闭传输页或关闭极速模式后会释放监听端口；启动回调在约两分钟内未完成时也会自动退出，因此可以直接重复下一轮测试。
 
-### 临时完整诊断日志
+### 低开销诊断日志
 
-当前处于首次浏览器互操作排障阶段，Rust Agent 的日志临时固定为全局 `trace`。`launch`、`serve`、协议注册和协议移除每次运行都会创建独立日志文件，并同时输出到控制台：
+`launch`、`serve`、协议注册和协议移除每次运行都会创建独立日志文件：
 
 ```text
 C:\Users\Flynn\Documents\WinriseF-Agent-Logs\winrisef-agent-<时间>-<PID>.log
 ```
 
-复现 `Opening handshake failed` 后，按修改时间选择最新日志。日志覆盖进程启动/退出、短期证书元数据、UDP socket、Quinn transport、TLS、HTTP/3 SETTINGS、WebTransport CONNECT、Origin/path 路由、Bridge、ticket 和内存传输状态机。日志禁止记录证书私钥、完整 launch token、完整 peer ticket、文件内容和热路径 payload；不会为每个数据块输出日志。问题定位完成后必须将全局 `trace` 降级并清理这套临时诊断输出。
+默认过滤器只保留 Agent 的低频 `debug/info` 会话事件，并把 Quinn、Rustls 和 HTTP/3 内部日志限制为 `warn`；不记录数据包、ACK、STREAM frame 或逐块事件。Release 只写日志文件，Debug 同时输出控制台。每次测速完成会记录方向、lane 数、总字节、payload 耗时和平均 Mbps。日志禁止记录证书私钥、完整 launch token、完整 peer ticket、文件内容和热路径 payload。
+
+开发排障时可用 `WINRISEF_AGENT_LOG` 提供显式 `tracing-subscriber` filter；性能验收必须使用默认过滤器，不得开启 Quinn/Rustls trace。
 
 本地 `http://localhost` 只适合验证安装端 Bridge。跨设备 WebTransport 测速必须使用两端完全相同的 HTTPS Origin；通过局域网 IP 打开的普通 HTTP 页面不是安全上下文，不能使用 WebTransport。
 

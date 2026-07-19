@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 
 use clap::{Args, Parser, Subcommand};
 
+const DEFAULT_BENCHMARK_SESSIONS: usize = 6;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "winrisef-agent",
@@ -48,7 +50,7 @@ pub struct ServeArgs {
     pub max_transfer_size: u64,
 
     /// Maximum concurrently active benchmark sessions.
-    #[arg(long, default_value_t = 1, value_parser = parse_session_count)]
+    #[arg(long, default_value_t = DEFAULT_BENCHMARK_SESSIONS, value_parser = parse_session_count)]
     pub max_sessions: usize,
 
     /// Sample CPU/RSS once per second.
@@ -70,7 +72,7 @@ pub struct LaunchArgs {
     pub max_transfer_size: u64,
 
     /// Maximum concurrently active remote benchmark sessions.
-    #[arg(long, default_value_t = 1, value_parser = parse_session_count)]
+    #[arg(long, default_value_t = DEFAULT_BENCHMARK_SESSIONS, value_parser = parse_session_count)]
     pub max_sessions: usize,
 
     /// Sample CPU/RSS once per second.

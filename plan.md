@@ -62,8 +62,9 @@ Rust 仓库：`E:\Project\PROJECT\2026-Rust_Native_Transfer`
 - WebTransport 内存源/汇在目标局域网达到同方向 `iperf3` 单向基线的 90% 以上，或证明已经达到浏览器/网卡的稳定上限。
 - 安装端 NVMe 文件到纯网页端可直接落盘时，完整文件吞吐达到内存传输结果的 90% 以上。
 - 纯网页端发送到安装端 NVMe 时，完整文件吞吐达到内存传输结果的 90% 以上。
-- 默认一条 WebTransport session、一个双向控制流、四条单向文件数据流。
+- 性能门默认使用六条独立 WebTransport/QUIC connection；每条 connection 一个双向控制流和四条单向数据流。真实附件阶段沿用多 connection striping，具体并发数由基准和设备能力确定。
 - Rust 默认使用 64MiB extent、4MiB I/O block、每 lane 两个复用 buffer。
+- 内存性能门使用协议 v3：逻辑总量均分到六条独立 connection，每条内部使用 16MiB stripe 和四条 lane；正式大文件数据面仍使用 64MiB extent。
 - 50GB 文件传输期间 Rust Agent 常驻内存目标低于 128MiB；网页端额外传输内存目标低于 128MiB。
 
 ### 2.3 非目标
@@ -365,8 +366,8 @@ winrisef-agent adapters → application → winrisef-core
 3. Agent 创建短期证书并启动浏览器可连接的 WebTransport server。
 4. 实现受限的 session hello 和 benchmark-only 鉴权入口，为现有网页 adapter 固定协议契约。
 5. 完成 memory source/sink 的 Agent 侧双向引擎；测试大小只作为计数，不分配等量内存。
-6. 实现一条 session、一个控制流和四条单向数据流。
-7. 实现 4MiB buffer pool、64MiB extent 调度和有界 backpressure。
+6. 实现六条独立 benchmark session，每条一个控制流和四条单向数据流；任一路失败即关闭整组。
+7. 实现 memory benchmark 的 16MiB 固定 lane stripe、Rust 双向零拷贝 payload 和有界 browser writer backpressure；4MiB buffer pool 保留给后续真实文件 I/O。
 8. 实现固定二进制 stream/extent header，热路径无 JSON。
 9. 输出 elapsed、bytes、current/average Mbps、CPU、RSS 和错误分类。
 10. 提供协议 fixture 和 core 假适配器测试，不提供网页或桌面 UI。
@@ -530,13 +531,19 @@ winrisef-agent adapters → application → winrisef-core
 
 - `winrisef-core`：协议、extent、coverage 和固定 buffer pool；
 - `winrisef-agent`：无前端 WebTransport server、短期证书、鉴权和双向 memory engine；
-- `docs/protocol-v1.md`：供现有网页后续实现 adapter 的固定跨语言协议。
+- `docs/protocol-v3.md`：当前网页和 Agent 共用的六路并行 memory benchmark 跨语言协议。
 
 第一阶段代码已经完成格式化、workspace check、Clippy `-D warnings` 和测试构建验证，没有启动 Agent、执行测试用例或运行传输。真实浏览器互操作、吞吐与 `iperf3` 门槛仍处于未验证状态，必须在 Phase 2 修改现有网页后完成。
 
 2026-07-18 已补齐第一个可由用户手工执行的浏览器互操作闭环：Windows `winrisef://` 当前用户注册、可信 Origin 白名单、HTTPS fragment 回调、一次性 launch token、持久 Local Bridge、一次性 peer ticket、现有 WebRTC ticket 请求/响应，以及远端纯网页四 lane 双向内存测速入口。Agent 仍无 GUI，安装端网页仍不承载 benchmark payload，双方同时发布 Agent 时按 device ID 只保留一端。该闭环尚未由 Codex 启动或测试，吞吐、浏览器兼容性、防火墙行为和 `iperf3` 90% 门槛由用户下一步手工验证；真实文件选择和磁盘 I/O 尚未进入实现。
 
 2026-07-19 首次手工互操作已确认网页可以通过 `winrisef://` 启动 Agent、打开 HTTPS 回调页并将凭据交还主页面，但 Chrome 在连接 `127.0.0.1:17691` 的本机 Bridge 时报告 `ERR_QUIC_PROTOCOL_ERROR` / `Opening handshake failed`。排障阶段临时启用每进程全局 trace 日志，固定保存至用户 Documents 的 `WinriseF-Agent-Logs`；同时以显式 Quinn Incoming → TLS → HTTP/3 → WebTransport CONNECT 接受链替换会吞掉握手错误的 server 包装。定位并修复根因后必须降低日志级别并移除非必要诊断噪声。
+
+2026-07-19 首次性能实测确认 native benchmark 确实通过手机 `192.168.31.207` 直连 Agent `192.168.31.202:17691`，但 browser→Agent 仅约 51Mbps、Agent→browser 仅约 145Mbps，未达到同机 OpenSpeedTest 218/278Mbps 基线。根因审计发现全局同步 trace 在两次测试中产生约 53.5 万行/96MB QUIC 热路径日志，且 64MiB Agent→browser 测试因 64MiB extent 只有一条 lane 承载 payload。benchmark 协议升为 v2：默认日志降为低频分级事件，Agent 发送侧使用 BBR，stripe 改为 16MiB 并按 lane 确定性分配，浏览器吞吐计时排除 CONNECT/握手。聊天附件保持 WebRTC，只有用户复测双向均达到同方向基线 90% 后才能开始真实附件接入。
+
+2026-07-19 v2 热路径二次审计进一步移除整流量内存复制：Agent→browser 改为共享 4MiB immutable `Bytes` 直接进入 Quinn，browser→Agent 改为 ordered `read_chunk` 零拷贝计数；browser 每 lane 有界并行两个 write，WebTransport 显式请求 throughput 拥塞策略。Agent BBR 使用 1MiB initial cwnd 与 10ms LAN initial RTT，并在每次 payload 后输出包含 RTT、cwnd、丢包、MTU、UDP I/O batching 和 flow-control blocked frame 的单条 QUIC summary。该版本只完成编译/源码类型验证，性能仍必须由用户用 1GiB 双向手工复测确认。
+
+2026-07-19 v2 的 1GiB 复测显示 browser→Agent 稳定约 48.9Mbps，但 Agent 侧 RTT 5.36ms、零丢包、零拥塞和零流控阻塞，证明瓶颈位于手机 Chrome 的单 QUIC connection 发送端；Agent→browser 的 64MiB 已达到 243.8Mbps，而 1GiB 在约 16MiB 后停止，定位到 browser 先等待收齐四条 incoming stream、再开始读取造成的接收窗口互锁风险。对照克隆到 `.firecrawl/openspeedtest-speed-test` 的 OpenSpeedTest 官方源码，其默认用六路并行 XHR/HTTP 请求、30MB upload Blob 和 300ms stagger 聚合带宽。benchmark 协议因此升为 v3：六张独立一次性 ticket 建立六条独立 WebTransport/QUIC connection，逻辑总量均分并聚合计时；browser 在每条 incoming stream 到达时立即开始消费，禁止等待收齐后再读。
 
 ## 16. 参考依据
 

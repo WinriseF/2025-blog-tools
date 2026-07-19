@@ -1979,6 +1979,7 @@ name = "winrisef-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "getrandom 0.4.3",
  "quinn",

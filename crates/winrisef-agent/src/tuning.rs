@@ -5,6 +5,8 @@ use socket2::SockRef;
 const SOCKET_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 const CONNECTION_WINDOW: u64 = 128 * 1024 * 1024;
 const STREAM_WINDOW: u64 = 32 * 1024 * 1024;
+const INITIAL_CONGESTION_WINDOW: u64 = 1024 * 1024;
+const INITIAL_RTT: Duration = Duration::from_millis(10);
 
 pub fn endpoint(
     listen: SocketAddr,
@@ -15,6 +17,10 @@ pub fn endpoint(
         socket_buffer_bytes = SOCKET_BUFFER_SIZE,
         connection_window_bytes = CONNECTION_WINDOW,
         stream_window_bytes = STREAM_WINDOW,
+        congestion_controller = "bbr",
+        initial_congestion_window_bytes = INITIAL_CONGESTION_WINDOW,
+        initial_rtt_ms = INITIAL_RTT.as_millis(),
+        send_fairness = true,
         max_bidi_streams = 8,
         max_uni_streams = 32,
         keep_alive_seconds = 5,
@@ -27,6 +33,11 @@ pub fn endpoint(
     transport.stream_receive_window(quinn::VarInt::from_u32(STREAM_WINDOW as u32));
     transport.receive_window(quinn::VarInt::from_u32(CONNECTION_WINDOW as u32));
     transport.send_window(CONNECTION_WINDOW);
+    transport.send_fairness(true);
+    transport.initial_rtt(INITIAL_RTT);
+    let mut congestion = quinn::congestion::BbrConfig::default();
+    congestion.initial_window(INITIAL_CONGESTION_WINDOW);
+    transport.congestion_controller_factory(Arc::new(congestion));
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
     transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
 

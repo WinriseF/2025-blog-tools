@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, LineWriter, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -9,16 +9,17 @@ use std::{
 use anyhow::Context;
 use tracing_subscriber::fmt::MakeWriter;
 
-const DIAGNOSTIC_FILTER: &str = "trace";
-
+const DIAGNOSTIC_FILTER_ENV: &str = "WINRISEF_AGENT_LOG";
+const DEFAULT_DIAGNOSTIC_FILTER: &str = "winrisef_agent=debug,winrisef_core=debug,web_transport_quinn=info,quinn=warn,quinn_proto=warn,rustls=warn,h3=warn";
 #[derive(Clone)]
 struct TeeMakeWriter {
-    file: Arc<Mutex<File>>,
+    file: Arc<Mutex<LineWriter<File>>>,
+    console: bool,
 }
 
 struct TeeWriter {
-    file: Arc<Mutex<File>>,
-    stderr: io::Stderr,
+    file: Arc<Mutex<LineWriter<File>>>,
+    stderr: Option<io::Stderr>,
 }
 
 impl<'writer> MakeWriter<'writer> for TeeMakeWriter {
@@ -27,28 +28,33 @@ impl<'writer> MakeWriter<'writer> for TeeMakeWriter {
     fn make_writer(&'writer self) -> Self::Writer {
         TeeWriter {
             file: Arc::clone(&self.file),
-            stderr: io::stderr(),
+            stderr: self.console.then(io::stderr),
         }
     }
 }
 
 impl Write for TeeWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.stderr.write_all(bytes)?;
         let mut file = self
             .file
             .lock()
             .map_err(|_| io::Error::other("diagnostic log lock is poisoned"))?;
         file.write_all(bytes)?;
+        if let Some(stderr) = &mut self.stderr {
+            stderr.write_all(bytes)?;
+        }
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.stderr.flush()?;
         self.file
             .lock()
             .map_err(|_| io::Error::other("diagnostic log lock is poisoned"))?
-            .flush()
+            .flush()?;
+        if let Some(stderr) = &mut self.stderr {
+            stderr.flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -73,10 +79,14 @@ pub fn init() -> anyhow::Result<PathBuf> {
         .write(true)
         .open(&path)
         .with_context(|| format!("failed to create diagnostic log {}", path.display()))?;
+    let filter_text = std::env::var(DIAGNOSTIC_FILTER_ENV)
+        .unwrap_or_else(|_| DEFAULT_DIAGNOSTIC_FILTER.to_owned());
+    let filter = tracing_subscriber::EnvFilter::try_new(&filter_text)
+        .with_context(|| format!("invalid {DIAGNOSTIC_FILTER_ENV} log filter"))?;
     let writer = TeeMakeWriter {
-        file: Arc::new(Mutex::new(file)),
+        file: Arc::new(Mutex::new(LineWriter::new(file))),
+        console: cfg!(debug_assertions),
     };
-    let filter = tracing_subscriber::EnvFilter::new(DIAGNOSTIC_FILTER);
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(false)
@@ -94,6 +104,7 @@ pub fn init() -> anyhow::Result<PathBuf> {
         version = env!("CARGO_PKG_VERSION"),
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
+        filter = %filter_text,
         "diagnostic logging initialized"
     );
     Ok(path)
