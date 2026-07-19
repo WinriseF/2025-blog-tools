@@ -8,7 +8,7 @@ const DEFAULT_BENCHMARK_SESSIONS: usize = 6;
 #[command(
     name = "winrisef-agent",
     version,
-    about = "Headless WinriseF WebTransport accelerator"
+    about = "Headless WinriseF LNA HTTP/TCP and WebTransport accelerator"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -63,7 +63,7 @@ pub struct LaunchArgs {
     /// Full winrisef:// activation URI supplied by the browser.
     pub uri: String,
 
-    /// UDP address used for the local Bridge and remote benchmark endpoint.
+    /// Shared numeric port for the TCP/LNA endpoint and UDP/WebTransport endpoints.
     #[arg(long, default_value = "0.0.0.0:17691")]
     pub listen: SocketAddr,
 

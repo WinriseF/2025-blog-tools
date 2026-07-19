@@ -9,6 +9,7 @@ use crate::{
     auth::TicketAuthority,
     bridge, certificate,
     cli::ServeArgs,
+    lna_http::{self, LnaHttpSettings},
     transfer::{self, TransferAuthenticator, TransferSettings},
     tuning,
 };
@@ -82,6 +83,7 @@ pub async fn run_manual(args: ServeArgs) -> anyhow::Result<()> {
         args.max_sessions,
         settings,
         None,
+        None,
         |_| Ok(()),
     )
     .await
@@ -109,6 +111,13 @@ pub async fn run_launched(
             tracing::trace!("launch timeout elapsed after Bridge authentication; no action needed");
         }
     });
+    let lna_settings = LnaHttpSettings {
+        allowed_origin: args.allowed_origin.clone(),
+        authority: authority.clone(),
+        max_transfer_size: args.max_transfer_size,
+        max_sessions: args.max_sessions,
+        metrics_enabled: args.metrics_enabled,
+    };
     let settings = ServerSettings {
         allowed_origins: vec![args.allowed_origin],
         mode: ServerMode::Launched {
@@ -126,6 +135,7 @@ pub async fn run_launched(
         args.certificate_ips,
         args.max_sessions,
         settings,
+        Some(lna_settings),
         Some(shutdown_rx),
         on_ready,
     )
@@ -137,6 +147,7 @@ async fn run_server(
     certificate_ips: Vec<IpAddr>,
     max_sessions: usize,
     settings: ServerSettings,
+    lna_settings: Option<LnaHttpSettings>,
     mut shutdown: Option<watch::Receiver<bool>>,
     on_ready: impl FnOnce(&ReadyInfo) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
@@ -177,8 +188,20 @@ async fn run_server(
         port: local_addr.port(),
         certificate_sha256,
     };
+    let lna_task = if let Some(lna_settings) = lna_settings {
+        let lna_shutdown = shutdown
+            .as_ref()
+            .context("LNA HTTP endpoint requires a shutdown channel")?
+            .clone();
+        Some(lna_http::start(local_addr, lna_settings, lna_shutdown).await?)
+    } else {
+        None
+    };
     on_ready(&ready)?;
-    tracing::info!(port = ready.port, "headless WebTransport accelerator ready");
+    tracing::info!(
+        port = ready.port,
+        "headless LNA HTTP/TCP and WebTransport accelerator ready"
+    );
 
     let settings = Arc::new(settings);
     let transfer_sessions = Arc::new(Semaphore::new(max_sessions));
@@ -236,6 +259,12 @@ async fn run_server(
     }
     endpoint.close(0_u32.into(), b"Agent shutdown");
     endpoint.wait_idle().await;
+    if let ServerMode::Launched { shutdown, .. } = &settings.mode {
+        let _ = shutdown.send(true);
+    }
+    if let Some(task) = lna_task {
+        task.await.context("LNA HTTP/TCP task panicked")??;
+    }
     tracing::info!("QUIC endpoint shut down cleanly");
     Ok(())
 }

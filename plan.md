@@ -1,6 +1,6 @@
 # WinriseF 单端原生增强传输开发计划
 
-状态：架构修订版 1
+状态：架构修订版 2（LNA HTTP/TCP 主数据面）
 
 日期：2026-07-18
 
@@ -20,13 +20,14 @@ Rust 仓库：`E:\Project\PROJECT\2026-Rust_Native_Transfer`
 安装端设备 A
 ┌────────────────────────────────────────────┐
 │ 网页 A  ⇄  本机 Rust Agent                │
-│  UI/会话      文件选择、原生文件 I/O、QUIC │
+│  UI/会话      文件选择、原生文件 I/O       │
 └──────────────────┬─────────────────────────┘
-                   │ WebTransport / HTTP/3 / QUIC
+                   │ 首选：Chrome LNA + HTTP/1.1/TCP 多 XHR
+                   │ 兼容：WebTransport / HTTP/3 / QUIC 六路
                    │ 远端网页主动连接
 ┌──────────────────▼─────────────────────────┐
 │ 纯网页设备 B                               │
-│ WebTransport + 浏览器 File/Storage API     │
+│ 浏览器 XHR/Blob + File/Storage API          │
 │ 不安装程序                                 │
 └────────────────────────────────────────────┘
 ```
@@ -40,9 +41,10 @@ Rust 仓库：`E:\Project\PROJECT\2026-Rust_Native_Transfer`
 - Rust 项目不提供网页、桌面窗口或其他前端；所有产品 UI 都在 `2025-blog-public`。
 - Windows Agent 只以单个便携 EXE 发布：无安装器、无服务、无托盘、无开机启动；首次双击仅在当前用户范围自注册 `winrisef://` 并打开官网结果页。
 - EXE 直接在用户选择的位置运行，不复制自身；移动或重命名后再次双击，用新路径覆盖协议注册。
-- 浏览器不能监听任意 QUIC/TCP 端口，因此纯网页端总是 WebTransport 客户端，Rust Agent 总是 WebTransport 服务端。
-- TCP/TLS 不能作为正式的浏览器端到端数据通道；原生 TCP/QUIC 只能作为性能上限诊断工具。
-- WebTransport 不可用、UDP 被阻断、局域网地址不可达或权限被拒绝时，自动保留现有 WebRTC DataChannel 路径。
+- 浏览器不能监听端口；纯网页端始终是连接发起方，Rust Agent 同时提供受限 HTTP/TCP 数据 API 和 WebTransport 兼容端点，不提供网页或 UI。
+- Chrome 142+ 的 Local Network Access（LNA）权限允许正式 HTTPS 页面在用户授权后请求局域网 Agent 的明文 HTTP endpoint；该路径是极速模式默认数据面。
+- 用户明确拒绝 LNA 权限时，本次会话的极速模式不可用，直接保留现有 WebRTC DataChannel，不得改试 WebTransport 来绕过用户决定。
+- 只有浏览器根本不识别 LNA permission descriptor 时，才回退到已验证的上一版六路上传、六路下载 WebTransport/QUIC；支持 LNA 但端点不可达、CORS 错误或 Agent 版本过旧均应明确报错，不伪装成“不支持”。
 
 ## 2. 项目目标
 
@@ -52,19 +54,20 @@ Rust 仓库：`E:\Project\PROJECT\2026-Rust_Native_Transfer`
 - 安装端发送时由 Rust 直接读取文件并向远端网页发送，文件字节不经过网页 A。
 - 安装端接收时由 Rust 直接将远端网页的数据写入目标文件，文件字节不经过网页 A。
 - 复用现有 `/t` 局域网会话、聊天 UI、Supabase Realtime 配对和 WebRTC 控制能力。
-- WebTransport 只承担可选的高速附件数据面，现有 WebRTC 继续承担聊天、能力协商、增强通道引导和完整回退。
+- LNA HTTP/TCP 是首选高速附件数据面，六路 WebTransport 是浏览器不支持 LNA 时的兼容数据面；现有 WebRTC 继续承担聊天、能力协商、增强通道引导和完整回退。
 - 传输 50GB 文件时，Rust Agent 与浏览器内存都保持有界，不随文件大小线性增长。
 - 极致单文件吞吐是首要目标；断点续传、多文件公平调度、跨会话恢复和历史等高级能力只能在不降低热路径吞吐、不增加明显内存压力和不扩大关键状态机的前提下加入。
 
 ### 2.2 性能目标
 
 - 先用 `iperf3` 测量同方向网络上限。
-- WebTransport 内存源/汇在目标局域网达到同方向 `iperf3` 单向基线的 90% 以上，或证明已经达到浏览器/网卡的稳定上限。
+- LNA HTTP/TCP 内存源/汇在目标局域网达到同方向 OpenSpeedTest/`iperf3` 单向基线的 90% 以上，或证明已经达到浏览器/网卡的稳定上限。
 - 安装端 NVMe 文件到纯网页端可直接落盘时，完整文件吞吐达到内存传输结果的 90% 以上。
 - 纯网页端发送到安装端 NVMe 时，完整文件吞吐达到内存传输结果的 90% 以上。
-- 性能门默认使用六条独立 WebTransport/QUIC connection；每条 connection 一个双向控制流和四条单向数据流。真实附件阶段沿用多 connection striping，具体并发数由基准和设备能力确定。
+- LNA 主路径默认使用六个并发 XHR worker；每个 worker 以约 30MiB 的有界 HTTP 请求循环复用浏览器 TCP connection，逻辑总量不一次性进入手机内存。
+- WebTransport 兼容路径固定恢复到实测上一版的六路上传、六路下载；每条 connection 一个双向控制流和四条单向数据流。
 - Rust 默认使用 64MiB extent、4MiB I/O block、每 lane 两个复用 buffer。
-- 内存性能门使用协议 v3：逻辑总量均分到六条独立 connection，每条内部使用 16MiB stripe 和四条 lane；正式大文件数据面仍使用 64MiB extent。
+- WebTransport 兼容性能门使用协议 v3：两个方向都把逻辑总量均分到六条独立 connection；每条内部使用 16MiB stripe 和四条 lane，正式大文件数据面仍使用 64MiB extent。
 - 50GB 文件传输期间 Rust Agent 常驻内存目标低于 128MiB；网页端额外传输内存目标低于 128MiB。
 
 ### 2.3 非目标
@@ -81,7 +84,7 @@ Rust 仓库：`E:\Project\PROJECT\2026-Rust_Native_Transfer`
 - 跨刷新持久断点续传；
 - 多个大文件并行占满多条独立 QUIC connection；
 - 压缩、逐块哈希、应用层逐块 ACK；
-- 用 TCP/TLS 替代 WebTransport 作为浏览器数据面。
+- 在没有 LNA 权限的浏览器中用任意方式绕过或诱导授权。
 
 ## 3. 现有网页能力与复用原则
 
@@ -102,7 +105,8 @@ Rust 仓库：`E:\Project\PROJECT\2026-Rust_Native_Transfer`
         │
         ├─ WebRTC Transport（所有浏览器可用，控制与回退）
         ├─ Native Agent Control Adapter（安装端网页 ⇄ localhost Agent）
-        └─ WebTransport Bulk Adapter（纯网页 ⇄ Agent，大文件数据面）
+        ├─ LNA HTTP Bulk Adapter（纯网页 ⇄ Agent，默认大文件数据面）
+        └─ WebTransport Bulk Adapter（仅 LNA 不受支持时兼容）
 ```
 
 WebRTC 在增强模式中仍然有价值：
@@ -110,7 +114,7 @@ WebRTC 在增强模式中仍然有价值：
 - 完成原有二维码配对和设备身份建立；
 - 交换 Agent capability、局域网 endpoint、证书 SHA-256 和一次性 session ticket；
 - 传输聊天、语音、小图片和低频附件控制；
-- WebTransport 建连失败时无缝回到现有附件路径。
+- LNA 被拒绝或增强数据面失败时回到现有 WebRTC 附件路径；只有 LNA API 不受支持才选择 WebTransport 兼容路径。
 
 文件 payload 一旦进入增强模式，就不得绕回 WebRTC 或网页 A。
 
@@ -144,25 +148,26 @@ WebRTC 在增强模式中仍然有价值：
 ### 4.2 远端数据连接
 
 ```text
-纯网页 B ── WebTransport(LAN) ── Rust Agent A
+纯网页 B ── LNA HTTP/1.1/TCP 多 XHR（默认） ── Rust Agent A
+          └─ WebTransport/QUIC 六路（仅不支持 LNA）
 ```
 
 职责：
 
 - 远端网页 B 始终主动连接；
-- Agent 监听 UDP/HTTP3，并接受经过授权的 WebTransport session；
-- 一条可靠双向控制流负责 session hello、附件元数据、接受、取消和最终确认；
-- 四条可靠单向数据流负责按 extent 发送文件数据；
-- Agent 与网页 B 都依赖流级 backpressure，不创建无限任务或无限队列。
+- Agent 在同一数字端口监听 TCP/HTTP1 和 UDP/HTTP3；HTTP endpoint 只是数据 API，不是 Rust 前端。
+- HTTP 路径按精确 Origin、方法、路径、Content-Length 和一次性 peer ticket 鉴权，并提供严格 CORS/LNA 响应头。
+- 网页使用六个并发 XHR worker 发送/接收约 30MiB 的有界请求；Agent 流式丢弃测速上传或流式生成测速下载，不分配逻辑总量。
+- WebTransport 兼容路径保留既有 control stream 和每 connection 四条可靠单向数据流，双方向均为六个 connection。
 
 Agent endpoint 引导流程：
 
 1. 网页 A 和网页 B 先通过现有 WebRTC 建立会话。
-2. 网页 A 从本机 Agent 获取 LAN 地址、端口、证书 hash、一次性 peer ticket 和过期时间。
+2. 网页 A 从本机 Agent 获取 LAN HTTP endpoint、WebTransport endpoint、证书 hash、一次性 peer ticket 和过期时间。
 3. 网页 A 通过已加密的 WebRTC DataChannel 将 Native Capability 发给网页 B。
-4. 网页 B 做 WebTransport feature detection，并在用户动作下处理可能出现的局域网权限提示。
-5. 网页 B 使用证书 hash 连接 Agent，并在第一条控制流提交 peer ticket、会话版本和绑定的设备 ID。
-6. Agent 验证成功后才允许创建文件数据流。
+4. 网页 B 在用户动作下查询 `local-network-access` permission：`denied` 关闭极速模式；permission 名称不受支持才选择六路 WebTransport；`prompt/granted` 先请求 HTTP probe 并处理 LNA 提示。
+5. LNA 成功时，网页 B 通过自定义 header 为每个 HTTP 数据请求提交一张一次性 ticket；WebTransport 兼容时仍在第一条控制流提交 ticket。
+6. Agent 验证 Origin、请求边界和 ticket 成功后才读取或发送 payload。
 
 第一版不通过公开 Supabase payload 直接发送可用 ticket；以后若必须脱离 WebRTC 引导，再单独设计端到端加密的信令扩展。
 
@@ -355,7 +360,7 @@ winrisef-agent adapters → application → winrisef-core
 
 ## 11. 实施阶段
 
-### Phase 0（第一阶段）：无前端 WebTransport 高速内核
+### Phase 0（第一阶段）：无前端原生高速内核
 
 目标：先完成可供现有网页连接的无前端 Rust 高速内核。该阶段不在 Rust 仓库创建网页客户端，也不实现 Agent ↔ Agent；浏览器互操作和实测在接入现有网页后完成。
 
@@ -363,10 +368,10 @@ winrisef-agent adapters → application → winrisef-core
 
 1. 审核并删除/重写当前由错误双原生方案产生的临时 scaffold；不得补完双 Rust CLI。
 2. 按第 8 节建立 `winrisef-core` 与 `winrisef-agent`。
-3. Agent 创建短期证书并启动浏览器可连接的 WebTransport server。
+3. Agent 创建短期证书并启动浏览器可连接的 WebTransport server，同时在同数字端口提供受限 LNA HTTP/TCP API。
 4. 实现受限的 session hello 和 benchmark-only 鉴权入口，为现有网页 adapter 固定协议契约。
 5. 完成 memory source/sink 的 Agent 侧双向引擎；测试大小只作为计数，不分配等量内存。
-6. 实现六条独立 benchmark session，每条一个控制流和四条单向数据流；任一路失败即关闭整组。
+6. LNA 默认路径实现六个并发 XHR worker 和 30MiB 有界请求循环；WebTransport 兼容路径在两个方向都使用六条独立 connection，每条一个控制流和四条单向数据流，任一路失败即关闭整组。
 7. 实现 memory benchmark 的 16MiB 固定 lane stripe、Rust 双向零拷贝 payload 和有界 browser writer backpressure；4MiB buffer pool 保留给后续真实文件 I/O。
 8. 实现固定二进制 stream/extent header，热路径无 JSON。
 9. 输出 elapsed、bytes、current/average Mbps、CPU、RSS 和错误分类。
@@ -403,16 +408,16 @@ winrisef-agent adapters → application → winrisef-core
 
 任务：
 
-1. 扩展网页 capability，检测 WebTransport；
+1. 扩展网页 capability，检测 Chrome LNA permission，并保留 WebTransport capability；
 2. 网页 A 通过现有 WebRTC 发送 Native Agent offer；
-3. 网页 B 使用 endpoint、hash 和 peer ticket 建连；
-4. Agent 校验 WebTransport Origin 与 in-band ticket；
+3. 网页 B 默认使用 LAN HTTP endpoint 和每请求 peer ticket；LNA permission descriptor 不受支持时才使用 WebTransport endpoint、hash 和每 connection ticket；
+4. Agent 校验 HTTP/WebTransport 的精确 Origin、请求边界与一次性 ticket；
 5. UI 显示“原生增强连接中/已启用/已回退”；
-6. 处理 Local Network Access 权限、UDP/防火墙和地址族错误；
+6. 区分 Local Network Access `denied`、API 不受支持、TCP endpoint 失败、UDP/防火墙和地址族错误；
 7. 失败保持现有 WebRTC 会话，不销毁聊天 Runtime。
 8. 在现有网页中加入仅开发环境可见的内存源/汇性能入口，不在 Rust 仓库创建前端。
 
-完成门槛：增强连接失败不会影响文字聊天或普通 WebRTC 文件传输；目标设备连续五轮 WebTransport 内存测试中位数达到同方向 `iperf3` 的 90%，相对中位数波动不超过 5%。
+完成门槛：增强连接失败不会影响文字聊天或普通 WebRTC 文件传输；目标设备连续五轮 LNA HTTP/TCP 内存测试中位数达到同方向 OpenSpeedTest/`iperf3` 的 90%，相对中位数波动不超过 5%。
 
 ### Phase 3：安装端发送大文件
 
@@ -516,14 +521,14 @@ winrisef-agent adapters → application → winrisef-core
 
 ## 14. 决策门
 
-- WebTransport 是本架构中浏览器与 Agent 的唯一原生高速候选，不再进行“QUIC 对 TCP/TLS，胜者进入生产”的错误选型。
+- Chrome 142+ LNA HTTP/TCP 是默认高速数据面；六上/六下 WebTransport 是仅供不支持 LNA 的浏览器使用的兼容路径，不再采用六上/一下策略。
 - 任何会话都不能出现两个 Agent；检测到远端也报告 Agent 时，不协商 Agent ↔ Agent，而是仅保留一端 Agent 或退回网页模式。
 - 两端均为手机时固定使用现有 WebRTC，原生项目不参与。
 - 高级功能默认不进入热路径；只有 benchmark 证明吞吐、CPU、内存和复杂度没有实质退化时才允许加入。
 - 不开发安装器、托盘、后台服务或开机启动；发布能力只围绕单文件 EXE、代码签名、下载校验和当前用户协议注册展开。
 - B0/B1 满速而 B6/B7 慢：优化文件 I/O 或浏览器存储，不改网络协议。
-- B0/B1 本身慢：检查浏览器实现、QUIC window、UDP buffer、CPU 和网卡，再决定是否维持 WebRTC-only 产品。
-- WebTransport 兼容性不足时，增强模式只对通过 capability probe 的浏览器开放；不能牺牲现有纯网页路径。
+- B0/B1 本身慢：先比较 LNA HTTP/TCP 与 OpenSpeedTest，再检查浏览器 XHR、TCP socket、CPU 和网卡；WebTransport 只分析兼容路径。
+- LNA 权限拒绝、LNA 端点失败和 LNA API 不受支持是三个不同状态，代码、日志和 UI 必须分别处理。
 
 ## 15. 当前仓库状态说明
 
@@ -531,7 +536,8 @@ winrisef-agent adapters → application → winrisef-core
 
 - `winrisef-core`：协议、extent、coverage 和固定 buffer pool；
 - `winrisef-agent`：无前端 WebTransport server、短期证书、鉴权和双向 memory engine；
-- `docs/protocol-v3.md`：当前网页和 Agent 共用的六路并行 memory benchmark 跨语言协议。
+- `docs/protocol-v3.md`：当前网页和 Agent 共用的双方向六 connection WebTransport 兼容 memory benchmark 协议。
+- `docs/lna-http-v1.md`：Chrome 142+ 默认六路 HTTP/TCP memory benchmark API。
 
 第一阶段代码已经完成格式化、workspace check、Clippy `-D warnings` 和测试构建验证，没有启动 Agent、执行测试用例或运行传输。真实浏览器互操作、吞吐与 `iperf3` 门槛仍处于未验证状态，必须在 Phase 2 修改现有网页后完成。
 
@@ -544,6 +550,12 @@ winrisef-agent adapters → application → winrisef-core
 2026-07-19 v2 热路径二次审计进一步移除整流量内存复制：Agent→browser 改为共享 4MiB immutable `Bytes` 直接进入 Quinn，browser→Agent 改为 ordered `read_chunk` 零拷贝计数；browser 每 lane 有界并行两个 write，WebTransport 显式请求 throughput 拥塞策略。Agent BBR 使用 1MiB initial cwnd 与 10ms LAN initial RTT，并在每次 payload 后输出包含 RTT、cwnd、丢包、MTU、UDP I/O batching 和 flow-control blocked frame 的单条 QUIC summary。该版本只完成编译/源码类型验证，性能仍必须由用户用 1GiB 双向手工复测确认。
 
 2026-07-19 v2 的 1GiB 复测显示 browser→Agent 稳定约 48.9Mbps，但 Agent 侧 RTT 5.36ms、零丢包、零拥塞和零流控阻塞，证明瓶颈位于手机 Chrome 的单 QUIC connection 发送端；Agent→browser 的 64MiB 已达到 243.8Mbps，而 1GiB 在约 16MiB 后停止，定位到 browser 先等待收齐四条 incoming stream、再开始读取造成的接收窗口互锁风险。对照克隆到 `.firecrawl/openspeedtest-speed-test` 的 OpenSpeedTest 官方源码，其默认用六路并行 XHR/HTTP 请求、30MB upload Blob 和 300ms stagger 聚合带宽。benchmark 协议因此升为 v3：六张独立一次性 ticket 建立六条独立 WebTransport/QUIC connection，逻辑总量均分并聚合计时；browser 在每条 incoming stream 到达时立即开始消费，禁止等待收齐后再读。
+
+2026-07-19 v3 的 1GiB 复测达到 browser→Agent 约 146Mbps、Agent→browser 约 207Mbps。六路上传 session 各约 24Mbps，Agent 端无丢包、无拥塞和无流控阻塞，说明多 connection 确实绕过了一部分 Chrome 单 QUIC sender 上限；当时据日志临时改成六上/一下，但随后跨两个网络的对照测试明确否定了该策略：上一版六上/六下在网络一为 141/214Mbps、网络二为 345/891Mbps，六上/一下分别只有 125/187Mbps 和 321/724Mbps。因此 WebTransport 兼容路径恢复为双方向六 connection。
+
+2026-07-19 正式性能架构改为 Chrome 142+ LNA 优先：从 `https://e.winrisef.top` 经用户 Local Network Access 授权，纯网页直接请求 Agent 的明文 HTTP/1.1/TCP 数据 API，以六个并发 XHR worker 和约 30MiB 有界请求循环逼近 OpenSpeedTest。用户拒绝 LNA 时极速模式不可用；只有 Permissions API 不识别 LNA permission 名称时才回退上述六上/六下 WebTransport，之后才保留普通 WebRTC。当前阶段先实现独立双向 memory benchmark，达到性能门后再接入真实聊天附件。
+
+2026-07-19 LNA memory benchmark 已完成代码接入：Agent 在与 UDP/QUIC 相同的数字端口监听 TCP，提供精确 Origin/CORS/LNA、一次性 ticket、64MiB 单请求硬上限、六 active request 上限和有界流式内存实现；启动回调与 WebRTC capability 同时发布 HTTP 和 WebTransport endpoints。远端网页使用 Chrome LNA permission probe、六个 XHR worker、30MiB 请求循环和每请求一张 ticket；`denied` 不进入 QUIC，permission descriptor 不受支持才进入恢复后的六上/六下 v3。聊天附件仍保持 WebRTC，尚未接入真实文件。代码只完成 `cargo check`、Clippy `-D warnings`、`cargo test --no-run`、TypeScript 源码检查和 Prettier 检查；Codex 没有启动 Agent、网页、浏览器、测试用例或吞吐测速，下一步由用户重新打包并手工验证。
 
 ## 16. 参考依据
 

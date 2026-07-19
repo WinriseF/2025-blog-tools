@@ -1,8 +1,10 @@
 # WinriseF WebTransport Memory Benchmark Protocol v3
 
-状态：浏览器互操作测试协议  
-传输：WebTransport over HTTP/3  
-端序：所有整数均为 big-endian  
+状态：LNA API 不受支持时的浏览器兼容测试协议
+
+传输：WebTransport over HTTP/3
+
+端序：所有整数均为 big-endian
 正式前端：`2025-blog-public`（本 Rust 仓库不提供前端）
 
 ## 1. 连接角色
@@ -32,7 +34,9 @@ Browser                         Rust Agent
 
 第一个应用流必须是 browser 创建的双向 control stream。鉴权成功前，Agent 不接受或创建文件数据流。
 
-一个逻辑测速固定由六个独立 WebTransport/QUIC connection 并行组成；每个 connection 使用一张不同的 120 秒一次性 ticket，并分别执行上面的完整 session 流程。browser 把逻辑 `total_size` 尽量均匀拆给六个 session，完成后以总 bytes 除以六路中最晚完成时间计算聚合吞吐。任一 session 握手或传输失败时，本次逻辑测速失败并关闭其余 connection。v3 不允许退回单 connection 模式伪装成聚合结果。
+一个逻辑测速在 browser→Agent 与 Agent→browser 两个方向都固定使用六个独立 WebTransport/QUIC connection 聚合。跨两个网络的对照测试已证明六上/一下策略比上一版六上/六下慢 7%–18.7%，因此禁止再按方向降为单 connection。每个 connection 使用一张不同的 120 秒一次性 ticket，并分别执行上面的完整 session 流程。
+
+browser 把逻辑 `total_size` 尽量均匀拆给当前方向的 session，完成后以总 bytes 除以其中最晚完成时间计算吞吐。任一 session 握手或传输失败时，本次逻辑测速失败并关闭其余 connection。v3 不允许使用与方向策略不一致的 connection 数伪装结果；每个 connection 内部始终保留四条 data lane。
 
 ## 3. Hello
 
@@ -150,7 +154,7 @@ END 后不得再出现数据，随后必须 FIN。协议不为每个 4MiB block 
 
 Agent 只有在四条 lane 全部成功、byte count 一致、extent coverage 完整后才返回 accepted。
 
-每个 Agent session 的吞吐计时从其 HelloAck 写出后开始；browser 聚合计时在六个 HelloAck 全部验证完成后开始，不包含 WebTransport CONNECT、TLS/QUIC 握手或 control hello。64MiB 快速测试均分后每 connection 约 10.7MiB，因此每条 connection 只有一个 payload lane，但六条独立 connection 均参与；1GiB 精准测试会使用全部 24 个 payload lane。每个 Agent session 仍按 `lane_id + n × lane_count` 确定性分配 stripe。
+每个 Agent session 的吞吐计时从其 HelloAck 写出后开始；browser 计时在当前方向所需的全部 HelloAck 验证完成后开始，不包含 WebTransport CONNECT、TLS/QUIC 握手或 control hello。64MiB 快速测试均分后每 connection 约 10.7MiB，因此每条 connection 只有一个 payload lane，但六条独立 connection 均参与；1GiB 精准测试在两个方向都会使用全部 24 个 payload lane。每个 Agent session 仍按 `lane_id + n × lane_count` 确定性分配 stripe。
 
 ## 7. 内存模式语义
 
@@ -170,10 +174,10 @@ Agent 只有在四条 lane 全部成功、byte count 一致、extent coverage �
 
 ## 8. 有界性
 
-- Agent 默认接受六个 active benchmark session，可配置为 1–8；Bridge 使用独立 semaphore，不占测速名额。
-- Agent benchmark 的应用层 payload allocation 每 active session 固定为 4MiB，默认六路合计 24MiB，不随逻辑 `total_size` 增长；每条 Quinn connection 内部仍受 128MiB send/receive window 约束。
+- Agent 默认最多接受六个 active benchmark session，可配置为 1–8；Bridge 使用独立 semaphore，不占测速名额。
+- Agent benchmark 的应用层 payload allocation 每 active session 固定为 4MiB；Agent→browser 六路合计 24MiB，browser→Agent 使用 Quinn `Bytes` 直接计数，不随逻辑 `total_size` 增长。每条 Quinn connection 内部仍受 128MiB send/receive window 约束。
 - browser sender 在六路之间共享四个 4MiB source block，每个 session 的每 lane 最多两个 `writer.write` 同时在途；不得无界排队 Promise。
-- 默认每 session 四个 lane task，六路合计最多 24 个 data lane task。
+- 每 session 固定四个 lane task；两个方向最多都是 24 个 data lane task。
 - 不创建 per-block task、thread、channel、Rust heap copy 或逐块日志。
 - Phase 0 不包含断点续传、多文件并发、逐块 hash 或逐块 ACK。
 
@@ -189,9 +193,9 @@ winrisef://launch?returnUrl=<same-origin callback page>&nonce=<128-bit nonce>
 
 Agent 只接受内置正式 Origin、本机 loopback Origin，或注册 handler 时通过 `--trusted-origin` 明确写入的精确 HTTPS Origin；不会信任任意网页提供的 `returnUrl`。
 
-Agent 只接受 HTTPS return URL，开发环境额外允许 loopback HTTP。回调 fragment 包含 loopback Bridge endpoint、局域网 benchmark endpoint、短期 P-256 证书 SHA-256、一次性 launch token、nonce 和过期时间；query string、日志和 Supabase 中不包含 token。
+Agent 只接受 HTTPS return URL，开发环境额外允许 loopback HTTP。回调 fragment 包含 loopback Bridge endpoint、局域网 WebTransport benchmark endpoint、LNA HTTP base endpoint、短期 P-256 证书 SHA-256、一次性 launch token、nonce 和过期时间；query string、日志和 Supabase 中不包含 token。
 
-安装端网页连接 `/winrisef/bridge/v1` 后在首个双向流发送 32-byte `WRNFBH01` hello。launch token 验证成功后只能消费一次。Bridge 使用固定 16-byte `WRNFTR01` request 和 40-byte `WRNFTS01` response 签发 120 秒有效、只能消费一次的 benchmark ticket。一个 v3 逻辑测速必须独立申请六张 ticket；不得把单张 ticket 改成六次可消费。安装端网页通过现有加密 WebRTC DataChannel 把 ticket 交给指定纯网页连接，文件/测速 payload 不经过安装端网页。
+安装端网页连接 `/winrisef/bridge/v1` 后在首个双向流发送 32-byte `WRNFBH01` hello。launch token 验证成功后只能消费一次。Bridge 使用固定 16-byte `WRNFTR01` request 和 40-byte `WRNFTS01` response 签发 120 秒有效、只能消费一次的 benchmark ticket。v3 的两个方向都必须独立申请六张 ticket。不得把单张 ticket 改成多次可消费。安装端网页通过现有加密 WebRTC DataChannel 把 ticket 交给指定纯网页连接，文件/测速 payload 不经过安装端网页。
 
 如果双方都发布本机 Agent capability，网页按稳定 device ID 排序，只保留一端 Agent；不会建立 Agent ↔ Agent。
 

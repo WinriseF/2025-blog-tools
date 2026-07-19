@@ -11,6 +11,7 @@ use crate::{
     auth::{TicketAuthority, now_ms, random_token},
     certificate,
     cli::LaunchArgs,
+    lna_http::LNA_HTTP_BASE_PATH,
     server::{self, BENCHMARK_PATH, BRIDGE_PATH, LaunchedServerSettings, ReadyInfo},
 };
 
@@ -182,9 +183,20 @@ fn build_callback_url(
     fragment.append_pair("expires", &launch_expires_at_ms.to_string());
     for ip in lan_ips {
         fragment.append_pair("lan", &endpoint(*ip, ready.port, BENCHMARK_PATH));
+        fragment.append_pair(
+            "lan-http",
+            &http_endpoint(*ip, ready.port, LNA_HTTP_BASE_PATH),
+        );
     }
     return_url.set_fragment(Some(&fragment.finish()));
     return_url
+}
+
+fn http_endpoint(ip: IpAddr, port: u16, path: &str) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("http://{ip}:{port}{path}"),
+        IpAddr::V6(ip) => format!("http://[{ip}]:{port}{path}"),
+    }
 }
 
 fn endpoint(ip: IpAddr, port: u16, path: &str) -> String {

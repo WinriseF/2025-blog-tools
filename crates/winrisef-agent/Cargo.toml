@@ -1,6 +1,6 @@
 [package]
 name = "winrisef-agent"
-description = "Headless WebTransport native accelerator for WinriseF"
+description = "Headless LNA HTTP/TCP and WebTransport accelerator for WinriseF"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

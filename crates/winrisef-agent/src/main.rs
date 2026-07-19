@@ -8,6 +8,7 @@ mod certificate;
 mod cli;
 mod diagnostics;
 mod launch;
+mod lna_http;
 mod metrics;
 mod protocol_registration;
 mod server;
