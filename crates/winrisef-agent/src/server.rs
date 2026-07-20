@@ -9,7 +9,7 @@ use crate::{
     auth::TicketAuthority,
     bridge, certificate,
     cli::ServeArgs,
-    file_transfer::FileTransferManager,
+    file_transfer::{FILE_WEBTRANSPORT_CONNECTIONS, FileTransferManager},
     file_webtransport::{self, FILE_WEBTRANSPORT_PATH},
     lna_http::{self, LnaHttpSettings},
     transfer::{self, TransferAuthenticator, TransferSettings},
@@ -172,13 +172,12 @@ async fn run_server(
     );
     let identity = certificate::generate_identity(&certificate_ips)?;
     let certificate_sha256 = certificate::format_sha256(&identity.sha256);
-    let mut tls = rustls::ServerConfig::builder_with_provider(
-        web_transport_quinn::crypto::default_provider(),
-    )
-    .with_protocol_versions(&[&TLS13])?
-    .with_no_client_auth()
-    .with_single_cert(identity.certificate_chain, identity.private_key)
-    .context("failed to configure the WebTransport certificate")?;
+    let mut tls =
+        rustls::ServerConfig::builder_with_provider(web_transport_quinn::crypto::default_provider())
+            .with_protocol_versions(&[&TLS13])?
+            .with_no_client_auth()
+            .with_single_cert(identity.certificate_chain, identity.private_key)
+            .context("failed to configure the WebTransport certificate")?;
     tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
     tracing::debug!(
         tls_version = "1.3",
@@ -213,7 +212,7 @@ async fn run_server(
     let settings = Arc::new(settings);
     let transfer_sessions = Arc::new(Semaphore::new(max_sessions));
     let bridge_sessions = Arc::new(Semaphore::new(1));
-    let file_sessions = Arc::new(Semaphore::new(6));
+    let file_sessions = Arc::new(Semaphore::new(FILE_WEBTRANSPORT_CONNECTIONS));
     tracing::info!(
         listen = %local_addr,
         max_transfer_sessions = max_sessions,
@@ -269,10 +268,7 @@ async fn run_server(
     }
     endpoint.close(0_u32.into(), b"Agent shutdown");
     endpoint.wait_idle().await;
-    if let ServerMode::Launched {
-        shutdown, files, ..
-    } = &settings.mode
-    {
+    if let ServerMode::Launched { shutdown, files, .. } = &settings.mode {
         files.cancel_all();
         let _ = shutdown.send(true);
     }
@@ -410,11 +406,7 @@ fn request_route(
         .ok_or(RouteRejection::MissingOrigin)?
         .to_str()
         .map_err(|_| RouteRejection::InvalidOrigin)?;
-    if !settings
-        .allowed_origins
-        .iter()
-        .any(|allowed| allowed == origin)
-    {
+    if !settings.allowed_origins.iter().any(|allowed| allowed == origin) {
         return Err(RouteRejection::OriginNotAllowed);
     }
     match &settings.mode {
@@ -427,10 +419,7 @@ fn request_route(
 }
 
 fn validate_origin_list(origins: &[String]) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !origins.is_empty(),
-        "at least one browser Origin is required"
-    );
+    anyhow::ensure!(!origins.is_empty(), "at least one browser Origin is required");
     anyhow::ensure!(
         origins.iter().all(|origin| valid_origin(origin)),
         "origins must use HTTPS; loopback HTTP is allowed only for development"
@@ -446,6 +435,5 @@ fn valid_origin(origin: &str) -> bool {
         return false;
     }
     url.scheme() == "https"
-        || (url.scheme() == "http"
-            && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")))
+        || (url.scheme() == "http" && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")))
 }

@@ -559,7 +559,9 @@ winrisef-agent adapters → application → winrisef-core
 
 2026-07-19 LNA memory benchmark 已完成代码接入：Agent 在与 UDP/QUIC 相同的数字端口监听 TCP，提供精确 Origin/CORS/LNA、一次性 ticket、64MiB 单请求硬上限、六 active request 上限和有界流式内存实现；启动回调与 WebRTC capability 同时发布 HTTP 和 WebTransport endpoints。远端网页使用 Chrome LNA permission probe、六个 XHR worker、30MiB 请求循环和每请求一张 ticket；`denied` 不进入 QUIC，permission descriptor 不受支持才进入恢复后的六上/六下 v3。
 
-2026-07-19 正式文件接入已完成代码实现：协议升级到 LAN V11 与 Bridge V2，新增 opaque source registry、系统文件选择/保存、全局单 active transfer、`.part`/sync/同文件系统原子完成，以及独立于 benchmark 的 Native File V1。正式 LNA 路径使用六 XHR、最大 30MiB segment 和 4MiB 池化 positional I/O；正式 WebTransport 回退使用六 connection、每 connection 四 lane、64MiB extent 和最多 24 个 4MiB buffer。网页通过独立 local-agent/peer-bulk ports 把 native 编排注入现有聊天 Runtime，`>=64MiB` 普通文件在 `NEXT_PUBLIC_LAN_NATIVE_FILE_V1=true` 时自动尝试极速，图片、语音和小文件仍走 WebRTC。LNA 拒绝、unsupported 和 endpoint failure 保持不同语义。代码阶段只执行静态/编译验证；Codex 不启动 Agent、网页、浏览器、测试用例或吞吐测速，双向 64MiB/1GiB/10GiB 与 SHA-256 由用户手工验收。
+2026-07-19 正式文件接入已完成代码实现：协议升级到 LAN V11 与 Bridge V2，新增 opaque source registry、系统文件选择/保存、全局单 active transfer、`.part`/sync/同文件系统原子完成，以及独立于 benchmark 的 Native File V1。正式 LNA 路径使用六 XHR、最大 30MiB segment 和 4MiB 池化 positional I/O；正式 WebTransport 回退使用六 connection、每 connection 四 lane、64MiB extent 和最多 24 个 4MiB buffer。网页通过独立 local-agent/peer-bulk ports 把 native 编排注入现有聊天 Runtime；用户开启极速模式且 Agent 连接成功后，`>=64MiB` 普通文件默认自动尝试极速，不再要求额外部署特性开关，图片、语音和小文件仍走 WebRTC。LNA 拒绝、unsupported 和 endpoint failure 保持不同语义。代码阶段只执行静态/编译验证；Codex 不启动 Agent、网页、浏览器、测试用例或吞吐测速，双向 64MiB/1GiB/10GiB 与 SHA-256 由用户手工验收。
+
+2026-07-20 完成 V10/V11 新增链路清理：删除未消费的 `transfer-started`、事件冗余总量、grant 回显的固定/可推导字段、网页端重复队列状态和无引用 fixture 包装；合并 Bridge 关闭、LNA endpoint 选择、十六进制解析与 positional I/O。鉴权、单 active transfer、精确 coverage、取消清理、`.part`、sync 和原子完成保持不变。Rust Clippy、workspace tests、网页 TypeScript 和跨仓库 fixture 检查通过；未启动 Agent、网页或真实传输。
 
 ## 16. 参考依据
 

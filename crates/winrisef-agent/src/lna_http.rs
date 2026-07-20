@@ -10,7 +10,7 @@ use tokio::{
 };
 
 use crate::{
-    auth::TicketAuthority,
+    auth::{TicketAuthority, parse_hex},
     file_http,
     file_transfer::{FILE_HTTP_PARALLELISM, FileTransferManager},
     metrics::Monitor,
@@ -150,26 +150,18 @@ async fn handle_connection(
 ) -> anyhow::Result<()> {
     let mut pending = Vec::with_capacity(MAX_HEADER_BYTES);
     loop {
-        let request =
-            match tokio::time::timeout(IDLE_TIMEOUT, read_request(&mut stream, &mut pending)).await
-            {
-                Ok(result) => match result {
-                    Ok(Some(request)) => request,
-                    Ok(None) => return Ok(()),
-                    Err(error) => {
-                        write_error(
-                            &mut stream,
-                            400,
-                            "invalid_request",
-                            &error.to_string(),
-                            None,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                },
-                Err(_) => return Ok(()),
-            };
+        let request = match tokio::time::timeout(IDLE_TIMEOUT, read_request(&mut stream, &mut pending)).await
+        {
+            Ok(result) => match result {
+                Ok(Some(request)) => request,
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    write_error(&mut stream, 400, "invalid_request", &error.to_string(), None).await?;
+                    return Ok(());
+                }
+            },
+            Err(_) => return Ok(()),
+        };
         let keep_alive = request.keep_alive;
         let origin_allowed = request.origin.as_deref() == Some(runtime.settings.allowed_origin.as_str());
         if !origin_allowed {
@@ -185,14 +177,7 @@ async fn handle_connection(
             return Ok(());
         }
 
-        let result = route_request(
-            &mut stream,
-            &mut pending,
-            request,
-            remote,
-            &runtime,
-        )
-        .await;
+        let result = route_request(&mut stream, &mut pending, request, remote, &runtime).await;
         if let Err(error) = result {
             tracing::warn!(%remote, error = ?error, "failed to serve LNA HTTP request");
             return Err(error);
@@ -272,16 +257,7 @@ async fn route_request(
             .await?;
         } else {
             tracing::info!(%remote, "LNA HTTP capability probe succeeded");
-            write_response(
-                stream,
-                204,
-                "text/plain",
-                0,
-                origin,
-                request.keep_alive,
-                &[],
-            )
-            .await?;
+            write_response(stream, 204, "text/plain", 0, origin, request.keep_alive, &[]).await?;
         }
         return Ok(());
     }
@@ -463,8 +439,7 @@ async fn receive_benchmark(
     let mut remaining = total_bytes - buffered as u64;
     let mut buffer = vec![0_u8; IO_BLOCK_BYTES];
     while remaining > 0 {
-        let count =
-            usize::try_from(remaining.min(buffer.len() as u64)).expect("read size is bounded");
+        let count = usize::try_from(remaining.min(buffer.len() as u64)).expect("read size is bounded");
         let read = tokio::time::timeout(IO_TIMEOUT, stream.read(&mut buffer[..count]))
             .await
             .context("timed out reading an LNA benchmark upload")??;
@@ -526,8 +501,7 @@ async fn send_benchmark(
     let progress = monitor.progress();
     let mut remaining = total_bytes;
     while remaining > 0 {
-        let count =
-            usize::try_from(remaining.min(zero_block.len() as u64)).expect("write size is bounded");
+        let count = usize::try_from(remaining.min(zero_block.len() as u64)).expect("write size is bounded");
         tokio::time::timeout(IO_TIMEOUT, stream.write_all(&zero_block[..count]))
             .await
             .context("timed out writing an LNA benchmark download")??;
@@ -558,10 +532,7 @@ pub(crate) struct HttpRequest {
     pub(crate) keep_alive: bool,
 }
 
-async fn read_request(
-    stream: &mut TcpStream,
-    pending: &mut Vec<u8>,
-) -> anyhow::Result<Option<HttpRequest>> {
+async fn read_request(stream: &mut TcpStream, pending: &mut Vec<u8>) -> anyhow::Result<Option<HttpRequest>> {
     let header_end = loop {
         if let Some(end) = find_header_end(pending) {
             break end;
@@ -582,8 +553,8 @@ async fn read_request(
         }
         pending.extend_from_slice(&buffer[..read]);
     };
-    let header = std::str::from_utf8(&pending[..header_end])
-        .context("HTTP headers are not valid UTF-8/ASCII")?;
+    let header =
+        std::str::from_utf8(&pending[..header_end]).context("HTTP headers are not valid UTF-8/ASCII")?;
     let request = parse_request(header)?;
     pending.drain(..header_end + 4);
     Ok(Some(request))
@@ -622,10 +593,10 @@ fn parse_request(header: &str) -> anyhow::Result<HttpRequest> {
         let value = value.trim();
         match name.as_str() {
             "origin" => set_once(&mut origin, value.to_owned(), "Origin")?,
-            TICKET_HEADER => set_once(&mut ticket, parse_hex_token(value, "benchmark ticket")?, "ticket")?,
+            TICKET_HEADER => set_once(&mut ticket, parse_hex(value, "benchmark ticket")?, "ticket")?,
             FILE_TOKEN_HEADER => set_once(
                 &mut file_token,
-                parse_hex_token(value, "file transfer token")?,
+                parse_hex(value, "file transfer token")?,
                 "file transfer token",
             )?,
             "content-length" => set_once(
@@ -641,9 +612,7 @@ fn parse_request(header: &str) -> anyhow::Result<HttpRequest> {
     }
     let (path, query) = target
         .split_once('?')
-        .map_or((target, None), |(path, query)| {
-            (path, Some(query.to_owned()))
-        });
+        .map_or((target, None), |(path, query)| (path, Some(query.to_owned())));
     Ok(HttpRequest {
         method: method.to_owned(),
         path: path.to_owned(),
@@ -665,20 +634,6 @@ fn set_once<T>(slot: &mut Option<T>, value: T, label: &str) -> anyhow::Result<()
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn parse_hex_token<const N: usize>(value: &str, label: &str) -> anyhow::Result<[u8; N]> {
-    anyhow::ensure!(
-        value.len() == N * 2,
-        "{label} must contain {} hexadecimal characters",
-        N * 2
-    );
-    let mut token = [0_u8; N];
-    for (index, byte) in token.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .with_context(|| format!("{label} is not hexadecimal"))?;
-    }
-    Ok(token)
 }
 
 fn parse_download_bytes(query: Option<&str>) -> anyhow::Result<u64> {
@@ -706,10 +661,7 @@ pub(crate) async fn write_preflight(
     keep_alive: bool,
 ) -> anyhow::Result<()> {
     let headers = [
-        (
-            "Access-Control-Allow-Methods",
-            "GET, POST, OPTIONS".to_owned(),
-        ),
+        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS".to_owned()),
         (
             "Access-Control-Allow-Headers",
             "Content-Type, X-WinriseF-Ticket, X-WinriseF-Transfer-Token".to_owned(),
@@ -798,17 +750,13 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_content_length() {
-        let request =
-            format!("POST {BENCHMARK_PATH} HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2");
+        let request = format!("POST {BENCHMARK_PATH} HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2");
         assert!(parse_request(&request).is_err());
     }
 
     #[test]
     fn accepts_only_one_download_size() {
-        assert_eq!(
-            parse_download_bytes(Some("bytes=31457280")).unwrap(),
-            31_457_280
-        );
+        assert_eq!(parse_download_bytes(Some("bytes=31457280")).unwrap(), 31_457_280);
         assert!(parse_download_bytes(Some("bytes=1&bytes=2")).is_err());
         assert!(parse_download_bytes(Some("size=1")).is_err());
     }

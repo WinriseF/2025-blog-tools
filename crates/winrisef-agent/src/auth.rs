@@ -91,20 +91,14 @@ impl TicketAuthority {
             tickets.len() < MAX_PENDING_TICKETS,
             "too many pending peer tickets"
         );
-        tickets.push(TicketRecord {
-            token,
-            expires_at_ms,
-        });
+        tickets.push(TicketRecord { token, expires_at_ms });
         tracing::info!(
             expires_at_ms,
             pending_before_issue,
             pending_after_issue = tickets.len(),
             "issued one-time peer ticket"
         );
-        Ok(PeerTicket {
-            token,
-            expires_at_ms,
-        })
+        Ok(PeerTicket { token, expires_at_ms })
     }
 
     pub fn consume_ticket(&self, token: &[u8; 16]) -> anyhow::Result<bool> {
@@ -122,10 +116,7 @@ impl TicketAuthority {
         }
         let Some(index) = matched else {
             tickets.retain(|ticket| ticket.expires_at_ms >= now);
-            tracing::warn!(
-                pending_after_cleanup = tickets.len(),
-                "peer ticket was not found"
-            );
+            tracing::warn!(pending_after_cleanup = tickets.len(), "peer ticket was not found");
             return Ok(false);
         };
         let ticket = tickets.remove(index);
@@ -160,11 +151,23 @@ pub fn now_ms() -> anyhow::Result<u64> {
         .unwrap_or(u64::MAX))
 }
 
-pub fn constant_time_equal(left: &[u8; 16], right: &[u8; 16]) -> bool {
+pub fn parse_hex<const N: usize>(value: &str, label: &str) -> anyhow::Result<[u8; N]> {
+    anyhow::ensure!(
+        value.len() == N * 2,
+        "{label} must contain {} hexadecimal characters",
+        N * 2
+    );
+    let mut bytes = [0_u8; N];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .with_context(|| format!("{label} is not hexadecimal"))?;
+    }
+    Ok(bytes)
+}
+
+pub fn constant_time_equal<const N: usize>(left: &[u8; N], right: &[u8; N]) -> bool {
     left.iter()
         .zip(right)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
+        .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
         == 0
 }

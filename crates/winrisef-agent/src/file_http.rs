@@ -9,8 +9,7 @@ use tokio::{
 
 use crate::{
     file_transfer::{
-        FILE_HTTP_PARALLELISM, FILE_IO_BLOCK_BYTES, FileTransferManager,
-        NativeFileDirection, SegmentLease,
+        FILE_HTTP_PARALLELISM, FILE_IO_BLOCK_BYTES, FileTransferManager, NativeFileDirection, SegmentLease,
     },
     lna_http::{HttpRequest, write_error, write_preflight, write_response},
 };
@@ -54,16 +53,7 @@ pub async fn route(
             .await;
         }
         tracing::info!(%remote, "Native File V1 LNA probe succeeded");
-        return write_response(
-            stream,
-            204,
-            "text/plain",
-            0,
-            origin,
-            request.keep_alive,
-            &[],
-        )
-        .await;
+        return write_response(stream, 204, "text/plain", 0, origin, request.keep_alive, &[]).await;
     }
     if request.transfer_encoding {
         return write_error(
@@ -106,34 +96,24 @@ pub async fn route(
             )
             .await;
         }
-        let _completion_permit = match Arc::clone(&active_requests)
-            .try_acquire_many_owned(FILE_HTTP_PARALLELISM as u32)
-        {
-            Ok(permit) => permit,
-            Err(_) => {
-                return write_error(
-                    stream,
-                    409,
-                    "transfer_still_active",
-                    "native file requests are still active",
-                    Some(origin),
-                )
-                .await;
-            }
-        };
+        let _completion_permit =
+            match Arc::clone(&active_requests).try_acquire_many_owned(FILE_HTTP_PARALLELISM as u32) {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return write_error(
+                        stream,
+                        409,
+                        "transfer_still_active",
+                        "native file requests are still active",
+                        Some(origin),
+                    )
+                    .await;
+                }
+            };
         return match files.complete_receive(transfer_id, &token) {
             Ok(()) => {
                 tracing::info!(%remote, transfer_id, "Native File V1 receive completed");
-                write_response(
-                    stream,
-                    204,
-                    "text/plain",
-                    0,
-                    origin,
-                    request.keep_alive,
-                    &[],
-                )
-                .await
+                write_response(stream, 204, "text/plain", 0, origin, request.keep_alive, &[]).await
             }
             Err(error) => {
                 write_error(
@@ -181,28 +161,15 @@ pub async fn route(
             }
             Ok(value) => value,
             Err(error) => {
-                return write_error(
-                    stream,
-                    400,
-                    "invalid_segment",
-                    &error.to_string(),
-                    Some(origin),
-                )
-                .await;
+                return write_error(stream, 400, "invalid_segment", &error.to_string(), Some(origin)).await;
             }
         },
         "POST" => {
             let (offset, _) = match parse_query(request.query.as_deref(), false) {
                 Ok(value) => value,
                 Err(error) => {
-                    return write_error(
-                        stream,
-                        400,
-                        "invalid_segment",
-                        &error.to_string(),
-                        Some(origin),
-                    )
-                    .await;
+                    return write_error(stream, 400, "invalid_segment", &error.to_string(), Some(origin))
+                        .await;
                 }
             };
             let Some(bytes) = request.content_length else {
@@ -236,14 +203,7 @@ pub async fn route(
     let lease = match files.begin_lna_segment(transfer_id, &token, direction, offset, bytes) {
         Ok(lease) => lease,
         Err(error) => {
-            return write_error(
-                stream,
-                401,
-                "transfer_rejected",
-                &error.to_string(),
-                Some(origin),
-            )
-            .await;
+            return write_error(stream, 401, "transfer_rejected", &error.to_string(), Some(origin)).await;
         }
     };
     let result = if request.method == "GET" {
@@ -307,7 +267,7 @@ async fn send_segment(
                 .context("file read buffer recycler closed")?;
             let count = usize::try_from((end - position).min(FILE_IO_BLOCK_BYTES as u64))
                 .expect("file block is bounded");
-            read_exact_at(&lease, &mut buffer[..count], position)?;
+            lease.read_exact_at(&mut buffer[..count], position)?;
             lease.touch()?;
             buffer.truncate(count);
             payload_tx
@@ -322,14 +282,9 @@ async fn send_segment(
             .await
             .context("timed out writing a native file segment")??;
         buffer.resize(FILE_IO_BLOCK_BYTES, 0);
-        recycle_tx
-            .send(buffer)
-            .await
-            .map_err(|_| anyhow::anyhow!("file read buffer recycler closed"))?;
+        let _ = recycle_tx.send(buffer).await;
     }
-    producer
-        .await
-        .context("native file read worker panicked")?
+    producer.await.context("native file read worker panicked")?
 }
 
 async fn receive_segment(
@@ -345,7 +300,7 @@ async fn receive_segment(
     let writer = tokio::task::spawn_blocking(move || -> anyhow::Result<SegmentLease> {
         let mut position = lease.offset();
         while let Some(buffer) = payload_rx.blocking_recv() {
-            write_all_at(&lease, &buffer, position)?;
+            lease.write_all_at(&buffer, position)?;
             lease.touch()?;
             position += buffer.len() as u64;
             let mut buffer = buffer;
@@ -354,7 +309,10 @@ async fn receive_segment(
                 .blocking_send(buffer)
                 .map_err(|_| anyhow::anyhow!("file upload buffer recycler closed"))?;
         }
-        anyhow::ensure!(position == lease.offset() + lease.len(), "uploaded segment length is inconsistent");
+        anyhow::ensure!(
+            position == lease.offset() + lease.len(),
+            "uploaded segment length is inconsistent"
+        );
         Ok(lease)
     });
     let mut remaining = total_len;
@@ -363,8 +321,8 @@ async fn receive_segment(
             .recv()
             .await
             .context("file upload buffer recycler closed")?;
-        let count = usize::try_from(remaining.min(FILE_IO_BLOCK_BYTES as u64))
-            .expect("file block is bounded");
+        let count =
+            usize::try_from(remaining.min(FILE_IO_BLOCK_BYTES as u64)).expect("file block is bounded");
         buffer.resize(count, 0);
 
         let buffered = count.min(pending.len());
@@ -373,12 +331,9 @@ async fn receive_segment(
             pending.drain(..buffered);
         }
         if buffered < count {
-            tokio::time::timeout(
-                IO_TIMEOUT,
-                stream.read_exact(&mut buffer[buffered..count]),
-            )
-            .await
-            .context("timed out reading a native file segment")??;
+            tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut buffer[buffered..count]))
+                .await
+                .context("timed out reading a native file segment")??;
         }
         payload_tx
             .send(buffer)
@@ -387,32 +342,8 @@ async fn receive_segment(
         remaining -= count as u64;
     }
     drop(payload_tx);
-    let lease = writer
-        .await
-        .context("native file write worker panicked")??;
+    let lease = writer.await.context("native file write worker panicked")??;
     Ok(lease)
-}
-
-fn read_exact_at(lease: &SegmentLease, mut buffer: &mut [u8], mut offset: u64) -> anyhow::Result<()> {
-    while !buffer.is_empty() {
-        let read = lease.read_at(buffer, offset).context("failed to read the selected file")?;
-        anyhow::ensure!(read > 0, "selected file ended during transfer");
-        offset += read as u64;
-        buffer = &mut buffer[read..];
-    }
-    Ok(())
-}
-
-fn write_all_at(lease: &SegmentLease, mut buffer: &[u8], mut offset: u64) -> anyhow::Result<()> {
-    while !buffer.is_empty() {
-        let written = lease
-            .write_at(buffer, offset)
-            .context("failed to write the destination file")?;
-        anyhow::ensure!(written > 0, "destination file accepted an empty write");
-        offset += written as u64;
-        buffer = &buffer[written..];
-    }
-    Ok(())
 }
 
 fn parse_path(path: &str) -> Option<(&str, &str)> {

@@ -57,7 +57,7 @@ Bridge 路径为 `/winrisef/bridge/v2`。每帧是 `4-byte big-endian JSON lengt
 - `release-source`
 - `issue-benchmark-ticket`
 
-文件元数据只包含 opaque source ID、文件名、大小和 MIME。Bridge 可推送 `transfer-started`、`transfer-progress`、`transfer-confirming`、`transfer-complete`、`transfer-failed`、`transfer-cancelled`；进度最多每 250ms 或每 32MiB 推送一次。
+文件元数据只包含 opaque source ID、文件名、大小和 MIME。Bridge 可推送 `transfer-progress`、`transfer-confirming`、`transfer-complete`、`transfer-failed`、`transfer-cancelled`；进度最多每 250ms 或每 32MiB 推送一次。
 
 ## 4. WebRTC V11 控制消息
 
@@ -72,7 +72,7 @@ Bridge 路径为 `/winrisef/bridge/v2`。每帧是 `4-byte big-endian JSON lengt
 
 ## 5. Grant 与鉴权
 
-grant 绑定 transfer ID、attachment ID、Agent owner、peer device ID、方向、总大小、数据面和固定并发参数。
+grant 只携带网页实际需要的 transfer ID、attachment ID、Agent owner 和授权 token。peer device ID、方向、总大小与数据面由 Agent 内部绑定；分段、并发和过期策略由 Native File V1 固定，不在每个 grant 中重复声明。
 
 - LNA 使用一个 256-bit token，只能放在 `X-WinriseF-Transfer-Token` 请求头。
 - WebTransport 使用六个 128-bit token，分别绑定 connection index，且每张只能消费一次。
@@ -116,4 +116,4 @@ LNA permission 结果语义不可混淆：
 
 ## 9. 产品选择规则
 
-仅 `NEXT_PUBLIC_LAN_NATIVE_FILE_V1=true` 时开启正式接入。普通文件且大小 `>=64MiB` 自动尝试 native；图片、语音、小文件、粘贴和拖放维持 WebRTC。极速模式开启时，安装端回形针调用 Agent 系统文件选择框；关闭时仍使用网页文件选择器。
+正式文件能力不需要额外的部署特性开关。用户开启极速模式且 Agent 连接成功后，普通文件且大小 `>=64MiB` 自动尝试 native；图片、语音、小文件、粘贴和拖放维持 WebRTC。极速模式开启时，安装端回形针调用 Agent 系统文件选择框；关闭时仍使用网页文件选择器。

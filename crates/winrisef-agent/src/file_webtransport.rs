@@ -2,16 +2,13 @@ use std::time::Duration;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use tokio::{
-    io::AsyncReadExt,
-    sync::mpsc,
-    task::JoinSet,
-};
+use tokio::{io::AsyncReadExt, sync::mpsc, task::JoinSet};
 use web_transport_quinn::{RecvStream, SendStream, Session};
 
+use crate::auth::parse_hex;
 use crate::file_transfer::{
     FILE_IO_BLOCK_BYTES, FILE_WEBTRANSPORT_CONNECTIONS, FILE_WEBTRANSPORT_EXTENT_BYTES,
-    FILE_WEBTRANSPORT_LANES_PER_CONNECTION, FileTransferManager, NativeFileDirection,
+    FILE_WEBTRANSPORT_LANES_PER_CONNECTION, FileTransferManager, NATIVE_FILE_VERSION, NativeFileDirection,
     SegmentLease, WebTransportConnectionLease,
 };
 
@@ -86,7 +83,7 @@ pub async fn run_session(session: Session, files: FileTransferManager) -> anyhow
     else {
         anyhow::bail!("Native File V1 hello is required");
     };
-    let configuration_valid = version == 1
+    let configuration_valid = version == NATIVE_FILE_VERSION
         && connection_index < FILE_WEBTRANSPORT_CONNECTIONS
         && lanes == FILE_WEBTRANSPORT_LANES_PER_CONNECTION
         && block_bytes == FILE_IO_BLOCK_BYTES
@@ -95,7 +92,7 @@ pub async fn run_session(session: Session, files: FileTransferManager) -> anyhow
         write_control(
             &mut control_send,
             &FileControlOutput::HelloAck {
-                version: 1,
+                version: NATIVE_FILE_VERSION,
                 accepted: false,
                 connection_index,
                 error: Some("Native File V1 configuration is invalid"),
@@ -104,7 +101,7 @@ pub async fn run_session(session: Session, files: FileTransferManager) -> anyhow
         .await?;
         anyhow::bail!("Native File V1 configuration is invalid");
     }
-    let token = parse_hex::<16>(&token).context("Native File V1 token is invalid")?;
+    let token = parse_hex::<16>(&token, "Native File V1 token")?;
     let connection = match files.begin_webtransport_connection(
         &transfer_id,
         &token,
@@ -117,7 +114,7 @@ pub async fn run_session(session: Session, files: FileTransferManager) -> anyhow
             write_control(
                 &mut control_send,
                 &FileControlOutput::HelloAck {
-                    version: 1,
+                    version: NATIVE_FILE_VERSION,
                     accepted: false,
                     connection_index,
                     error: Some("Native File V1 total size does not match"),
@@ -130,7 +127,7 @@ pub async fn run_session(session: Session, files: FileTransferManager) -> anyhow
             write_control(
                 &mut control_send,
                 &FileControlOutput::HelloAck {
-                    version: 1,
+                    version: NATIVE_FILE_VERSION,
                     accepted: false,
                     connection_index,
                     error: Some("Native File V1 authorization was rejected"),
@@ -143,7 +140,7 @@ pub async fn run_session(session: Session, files: FileTransferManager) -> anyhow
     write_control(
         &mut control_send,
         &FileControlOutput::HelloAck {
-            version: 1,
+            version: NATIVE_FILE_VERSION,
             accepted: true,
             connection_index,
             error: None,
@@ -152,15 +149,14 @@ pub async fn run_session(session: Session, files: FileTransferManager) -> anyhow
     .await?;
 
     let payload = match direction {
-        NativeFileDirection::AgentToBrowser => {
-            send_connection(&session, &files, &connection).await
-        }
-        NativeFileDirection::BrowserToAgent => {
-            receive_connection(&session, &files, &connection).await
-        }
+        NativeFileDirection::AgentToBrowser => send_connection(&session, &files, &connection).await,
+        NativeFileDirection::BrowserToAgent => receive_connection(&session, &files, &connection).await,
     };
     if let Err(error) = payload {
-        files.fail_transfer(connection.transfer_id(), "Native File V1 WebTransport payload failed");
+        files.fail_transfer(
+            connection.transfer_id(),
+            "Native File V1 WebTransport payload failed",
+        );
         session.close(1, b"native file failed");
         return Err(error);
     }
@@ -175,7 +171,10 @@ pub async fn run_session(session: Session, files: FileTransferManager) -> anyhow
             .await
             .context("timed out waiting for Native File V1 completion")??
             .context("Native File V1 control ended before completion")?;
-        anyhow::ensure!(matches!(completion, FileControlInput::Complete), "Native File V1 completion is invalid");
+        anyhow::ensure!(
+            matches!(completion, FileControlInput::Complete),
+            "Native File V1 completion is invalid"
+        );
         files.complete_webtransport_receive(&connection)?;
         write_control(&mut control_send, &FileControlOutput::TransferComplete).await?;
     }
@@ -213,7 +212,10 @@ async fn send_lane(
     connection: WebTransportConnectionLease,
     lane_index: usize,
 ) -> anyhow::Result<()> {
-    let mut send = session.open_uni().await.context("failed to open a Native File V1 lane")?;
+    let mut send = session
+        .open_uni()
+        .await
+        .context("failed to open a Native File V1 lane")?;
     send.write_all(&(lane_index as u16).to_be_bytes()).await?;
     for (offset, len) in assigned_extents(&connection, lane_index) {
         send.write_all(&extent_header(offset, len)).await?;
@@ -234,16 +236,25 @@ async fn receive_connection(
     let mut seen = [false; FILE_WEBTRANSPORT_LANES_PER_CONNECTION];
     let mut lanes = JoinSet::new();
     for _ in 0..FILE_WEBTRANSPORT_LANES_PER_CONNECTION {
-        let mut recv = session.accept_uni().await.context("failed to accept a Native File V1 lane")?;
-        let lane_index = usize::from(recv.read_u16().await.context("failed to read Native File V1 lane index")?);
-        anyhow::ensure!(lane_index < seen.len() && !seen[lane_index], "Native File V1 lane index is duplicate or invalid");
+        let mut recv = session
+            .accept_uni()
+            .await
+            .context("failed to accept a Native File V1 lane")?;
+        let lane_index = usize::from(
+            recv.read_u16()
+                .await
+                .context("failed to read Native File V1 lane index")?,
+        );
+        anyhow::ensure!(
+            lane_index < seen.len() && !seen[lane_index],
+            "Native File V1 lane index is duplicate or invalid"
+        );
         seen[lane_index] = true;
         lanes.spawn(receive_lane(recv, files.clone(), connection.clone(), lane_index));
     }
     while let Some(result) = lanes.join_next().await {
         result.context("Native File V1 receiver lane panicked")??;
     }
-    anyhow::ensure!(seen.into_iter().all(|value| value), "Native File V1 lanes are incomplete");
     Ok(())
 }
 
@@ -274,12 +285,17 @@ async fn send_extent(send: &mut SendStream, lease: SegmentLease) -> anyhow::Resu
         let mut position = lease.offset();
         let end = position + lease.len();
         while position < end {
-            let mut buffer = recycle_rx.blocking_recv().context("Native File V1 read buffer closed")?;
-            let count = usize::try_from((end - position).min(FILE_IO_BLOCK_BYTES as u64)).expect("file block is bounded");
-            read_exact_at(&lease, &mut buffer[..count], position)?;
+            let mut buffer = recycle_rx
+                .blocking_recv()
+                .context("Native File V1 read buffer closed")?;
+            let count = usize::try_from((end - position).min(FILE_IO_BLOCK_BYTES as u64))
+                .expect("file block is bounded");
+            lease.read_exact_at(&mut buffer[..count], position)?;
             lease.touch()?;
             buffer.truncate(count);
-            payload_tx.blocking_send(buffer).map_err(|_| anyhow::anyhow!("Native File V1 sender closed"))?;
+            payload_tx
+                .blocking_send(buffer)
+                .map_err(|_| anyhow::anyhow!("Native File V1 sender closed"))?;
             position += count as u64;
         }
         Ok(lease)
@@ -287,7 +303,7 @@ async fn send_extent(send: &mut SendStream, lease: SegmentLease) -> anyhow::Resu
     while let Some(mut buffer) = payload_rx.recv().await {
         send.write_all(&buffer).await?;
         buffer.resize(FILE_IO_BLOCK_BYTES, 0);
-        recycle_tx.send(buffer).await.map_err(|_| anyhow::anyhow!("Native File V1 read recycler closed"))?;
+        let _ = recycle_tx.send(buffer).await;
     }
     worker.await.context("Native File V1 read worker panicked")?
 }
@@ -300,23 +316,37 @@ async fn receive_extent(recv: &mut RecvStream, lease: SegmentLease) -> anyhow::R
     let worker = tokio::task::spawn_blocking(move || -> anyhow::Result<SegmentLease> {
         let mut position = lease.offset();
         while let Some(buffer) = payload_rx.blocking_recv() {
-            write_all_at(&lease, &buffer, position)?;
+            lease.write_all_at(&buffer, position)?;
             lease.touch()?;
             position += buffer.len() as u64;
             let mut buffer = buffer;
             buffer.resize(FILE_IO_BLOCK_BYTES, 0);
-            recycle_tx.blocking_send(buffer).map_err(|_| anyhow::anyhow!("Native File V1 write recycler closed"))?;
+            recycle_tx
+                .blocking_send(buffer)
+                .map_err(|_| anyhow::anyhow!("Native File V1 write recycler closed"))?;
         }
-        anyhow::ensure!(position == lease.offset() + lease.len(), "Native File V1 extent length is inconsistent");
+        anyhow::ensure!(
+            position == lease.offset() + lease.len(),
+            "Native File V1 extent length is inconsistent"
+        );
         Ok(lease)
     });
     let mut remaining = total;
     while remaining > 0 {
-        let mut buffer = recycle_rx.recv().await.context("Native File V1 write buffer closed")?;
-        let count = usize::try_from(remaining.min(FILE_IO_BLOCK_BYTES as u64)).expect("file block is bounded");
+        let mut buffer = recycle_rx
+            .recv()
+            .await
+            .context("Native File V1 write buffer closed")?;
+        let count =
+            usize::try_from(remaining.min(FILE_IO_BLOCK_BYTES as u64)).expect("file block is bounded");
         buffer.resize(count, 0);
-        recv.read_exact(&mut buffer).await.context("Native File V1 extent ended early")?;
-        payload_tx.send(buffer).await.map_err(|_| anyhow::anyhow!("Native File V1 write worker closed"))?;
+        recv.read_exact(&mut buffer)
+            .await
+            .context("Native File V1 extent ended early")?;
+        payload_tx
+            .send(buffer)
+            .await
+            .map_err(|_| anyhow::anyhow!("Native File V1 write worker closed"))?;
         remaining -= count as u64;
     }
     drop(payload_tx);
@@ -346,30 +376,12 @@ fn extent_header(offset: u64, len: u64) -> [u8; EXTENT_HEADER_BYTES] {
 
 async fn read_extent_header(recv: &mut RecvStream) -> anyhow::Result<(u64, u64)> {
     let mut header = [0_u8; EXTENT_HEADER_BYTES];
-    recv.read_exact(&mut header).await.context("failed to read Native File V1 extent header")?;
+    recv.read_exact(&mut header)
+        .await
+        .context("failed to read Native File V1 extent header")?;
     let offset = u64::from_be_bytes(header[..8].try_into().expect("extent offset has fixed size"));
     let len = u64::from_be_bytes(header[8..].try_into().expect("extent length has fixed size"));
     Ok((offset, len))
-}
-
-fn read_exact_at(lease: &SegmentLease, mut buffer: &mut [u8], mut offset: u64) -> anyhow::Result<()> {
-    while !buffer.is_empty() {
-        let read = lease.read_at(buffer, offset).context("failed to read a Native File V1 extent")?;
-        anyhow::ensure!(read > 0, "Native File V1 source ended early");
-        offset += read as u64;
-        buffer = &mut buffer[read..];
-    }
-    Ok(())
-}
-
-fn write_all_at(lease: &SegmentLease, mut buffer: &[u8], mut offset: u64) -> anyhow::Result<()> {
-    while !buffer.is_empty() {
-        let written = lease.write_at(buffer, offset).context("failed to write a Native File V1 extent")?;
-        anyhow::ensure!(written > 0, "Native File V1 destination accepted an empty write");
-        offset += written as u64;
-        buffer = &buffer[written..];
-    }
-    Ok(())
 }
 
 async fn read_control(recv: &mut RecvStream) -> anyhow::Result<Option<FileControlInput>> {
@@ -380,27 +392,26 @@ async fn read_control(recv: &mut RecvStream) -> anyhow::Result<Option<FileContro
     anyhow::ensure!(first == 1, "Native File V1 control prefix is invalid");
     recv.read_exact(&mut prefix[1..]).await?;
     let len = usize::try_from(u32::from_be_bytes(prefix)).expect("u32 fits usize");
-    anyhow::ensure!(len > 0 && len <= CONTROL_FRAME_MAX_BYTES, "Native File V1 control frame is invalid");
+    anyhow::ensure!(
+        len > 0 && len <= CONTROL_FRAME_MAX_BYTES,
+        "Native File V1 control frame is invalid"
+    );
     let mut body = vec![0_u8; len];
     recv.read_exact(&mut body).await?;
-    serde_json::from_slice(&body).context("Native File V1 control JSON is invalid").map(Some)
+    serde_json::from_slice(&body)
+        .context("Native File V1 control JSON is invalid")
+        .map(Some)
 }
 
 async fn write_control<T: Serialize>(send: &mut SendStream, value: &T) -> anyhow::Result<()> {
     let body = serde_json::to_vec(value)?;
-    anyhow::ensure!(body.len() <= CONTROL_FRAME_MAX_BYTES, "Native File V1 response is too large");
+    anyhow::ensure!(
+        body.len() <= CONTROL_FRAME_MAX_BYTES,
+        "Native File V1 response is too large"
+    );
     send.write_all(&(body.len() as u32).to_be_bytes()).await?;
     send.write_all(&body).await?;
     Ok(())
-}
-
-fn parse_hex<const N: usize>(value: &str) -> anyhow::Result<[u8; N]> {
-    anyhow::ensure!(value.len() == N * 2, "hex token has the wrong length");
-    let mut bytes = [0_u8; N];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).context("hex token is malformed")?;
-    }
-    Ok(bytes)
 }
 
 fn log_quic_summary(session: &Session, direction: NativeFileDirection, connection_index: usize) {

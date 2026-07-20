@@ -4,7 +4,7 @@ use serde_json::Value;
 use web_transport_quinn::{RecvStream, SendStream, Session};
 
 use crate::{
-    auth::TicketAuthority,
+    auth::{TicketAuthority, parse_hex},
     certificate,
     file_transfer::{FileTransferManager, NativeDataPlane},
 };
@@ -126,7 +126,7 @@ pub async fn run_session(
         .await?;
         anyhow::bail!("Bridge first frame was not hello");
     };
-    let token = parse_hex::<16>(&launch_token).context("invalid Bridge launch token")?;
+    let token = parse_hex::<16>(&launch_token, "Bridge launch token")?;
     let accepted = version == BRIDGE_VERSION && authority.consume_launch_token(&token)?;
     write_frame(
         &mut send,
@@ -188,10 +188,9 @@ async fn handle_input(
             (request_id, result)
         }
         BridgeInput::SelectFiles { request_id } => {
-            let result = files
-                .select_files()
-                .await
-                .and_then(|selected| serde_json::to_value(selected).context("failed to encode selected files"));
+            let result = files.select_files().await.and_then(|selected| {
+                serde_json::to_value(selected).context("failed to encode selected files")
+            });
             (request_id, result)
         }
         BridgeInput::CreateSendTransfer {
@@ -280,7 +279,10 @@ async fn read_frame(recv: &mut RecvStream) -> anyhow::Result<Option<BridgeInput>
         .await
         .context("failed to read a Bridge frame length")?;
     let len = usize::try_from(u32::from_be_bytes(prefix)).expect("u32 fits usize on supported targets");
-    anyhow::ensure!(len > 0 && len <= MAX_FRAME_BYTES, "Bridge frame length is invalid");
+    anyhow::ensure!(
+        len > 0 && len <= MAX_FRAME_BYTES,
+        "Bridge frame length is invalid"
+    );
     let mut bytes = vec![0_u8; len];
     recv.read_exact(&mut bytes)
         .await
@@ -300,14 +302,4 @@ async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> anyhow::
     send.write_all(&bytes)
         .await
         .context("failed to write a Bridge frame body")
-}
-
-fn parse_hex<const N: usize>(value: &str) -> anyhow::Result<[u8; N]> {
-    anyhow::ensure!(value.len() == N * 2, "hex value has the wrong length");
-    let mut bytes = [0_u8; N];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .context("hex value is malformed")?;
-    }
-    Ok(bytes)
 }
