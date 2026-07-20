@@ -6,6 +6,8 @@
 
 关联网页：`E:\Project\PROJECT\2025-blog-public`
 
+产品标识：`WinriseF Toolbox`；Windows 本机组件：`WinriseF Toolbox Agent`；当前发布版本：`v0.1.0-beta.1`。完整命名和版本规则见 [`docs/product-identity.md`](docs/product-identity.md)。
+
 ## 1. 阅读顺序与权威性
 
 任何开发者或 AI Agent 开始工作前，按以下顺序阅读：

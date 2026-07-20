@@ -6,6 +6,8 @@
 
 Rust 基线：1.97.1
 
+当前发布版本：`v0.1.0-beta.1`（Windows 资源版本 `0.1.0.1`）
+
 Rust 仓库：`E:\Project\PROJECT\2026-Rust_Native_Transfer`
 
 网页仓库：`E:\Project\PROJECT\2025-blog-public`
