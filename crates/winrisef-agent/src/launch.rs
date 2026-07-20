@@ -11,7 +11,9 @@ use crate::{
     auth::{TicketAuthority, now_ms, random_token},
     certificate,
     cli::LaunchArgs,
+    file_http::FILE_HTTP_BASE_PATH,
     lna_http::LNA_HTTP_BASE_PATH,
+    file_webtransport::FILE_WEBTRANSPORT_PATH,
     server::{self, BENCHMARK_PATH, BRIDGE_PATH, LaunchedServerSettings, ReadyInfo},
 };
 
@@ -186,6 +188,14 @@ fn build_callback_url(
         fragment.append_pair(
             "lan-http",
             &http_endpoint(*ip, ready.port, LNA_HTTP_BASE_PATH),
+        );
+        fragment.append_pair(
+            "file-http",
+            &http_endpoint(*ip, ready.port, FILE_HTTP_BASE_PATH),
+        );
+        fragment.append_pair(
+            "file-wt",
+            &endpoint(*ip, ready.port, FILE_WEBTRANSPORT_PATH),
         );
     }
     return_url.set_fragment(Some(&fragment.finish()));

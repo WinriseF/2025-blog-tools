@@ -88,7 +88,7 @@ Rust 仓库：`E:\Project\PROJECT\2026-Rust_Native_Transfer`
 
 ## 3. 现有网页能力与复用原则
 
-网页仓库已经包含 LAN Session V10：
+网页仓库已经包含 LAN Session V11：
 
 - `src/lib/lan-transfer/signal-client.ts`：Supabase Presence/Broadcast 信令；
 - `src/lib/lan-transfer/native-webrtc-transport.ts`：可靠有序 DataChannel；
@@ -555,7 +555,9 @@ winrisef-agent adapters → application → winrisef-core
 
 2026-07-19 正式性能架构改为 Chrome 142+ LNA 优先：从 `https://e.winrisef.top` 经用户 Local Network Access 授权，纯网页直接请求 Agent 的明文 HTTP/1.1/TCP 数据 API，以六个并发 XHR worker 和约 30MiB 有界请求循环逼近 OpenSpeedTest。用户拒绝 LNA 时极速模式不可用；只有 Permissions API 不识别 LNA permission 名称时才回退上述六上/六下 WebTransport，之后才保留普通 WebRTC。当前阶段先实现独立双向 memory benchmark，达到性能门后再接入真实聊天附件。
 
-2026-07-19 LNA memory benchmark 已完成代码接入：Agent 在与 UDP/QUIC 相同的数字端口监听 TCP，提供精确 Origin/CORS/LNA、一次性 ticket、64MiB 单请求硬上限、六 active request 上限和有界流式内存实现；启动回调与 WebRTC capability 同时发布 HTTP 和 WebTransport endpoints。远端网页使用 Chrome LNA permission probe、六个 XHR worker、30MiB 请求循环和每请求一张 ticket；`denied` 不进入 QUIC，permission descriptor 不受支持才进入恢复后的六上/六下 v3。聊天附件仍保持 WebRTC，尚未接入真实文件。代码只完成 `cargo check`、Clippy `-D warnings`、`cargo test --no-run`、TypeScript 源码检查和 Prettier 检查；Codex 没有启动 Agent、网页、浏览器、测试用例或吞吐测速，下一步由用户重新打包并手工验证。
+2026-07-19 LNA memory benchmark 已完成代码接入：Agent 在与 UDP/QUIC 相同的数字端口监听 TCP，提供精确 Origin/CORS/LNA、一次性 ticket、64MiB 单请求硬上限、六 active request 上限和有界流式内存实现；启动回调与 WebRTC capability 同时发布 HTTP 和 WebTransport endpoints。远端网页使用 Chrome LNA permission probe、六个 XHR worker、30MiB 请求循环和每请求一张 ticket；`denied` 不进入 QUIC，permission descriptor 不受支持才进入恢复后的六上/六下 v3。
+
+2026-07-19 正式文件接入已完成代码实现：协议升级到 LAN V11 与 Bridge V2，新增 opaque source registry、系统文件选择/保存、全局单 active transfer、`.part`/sync/同文件系统原子完成，以及独立于 benchmark 的 Native File V1。正式 LNA 路径使用六 XHR、最大 30MiB segment 和 4MiB 池化 positional I/O；正式 WebTransport 回退使用六 connection、每 connection 四 lane、64MiB extent 和最多 24 个 4MiB buffer。网页通过独立 local-agent/peer-bulk ports 把 native 编排注入现有聊天 Runtime，`>=64MiB` 普通文件在 `NEXT_PUBLIC_LAN_NATIVE_FILE_V1=true` 时自动尝试极速，图片、语音和小文件仍走 WebRTC。LNA 拒绝、unsupported 和 endpoint failure 保持不同语义。代码阶段只执行静态/编译验证；Codex 不启动 Agent、网页、浏览器、测试用例或吞吐测速，双向 64MiB/1GiB/10GiB 与 SHA-256 由用户手工验收。
 
 ## 16. 参考依据
 

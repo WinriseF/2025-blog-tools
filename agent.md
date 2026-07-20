@@ -58,7 +58,7 @@
 
 网页项目是现有产品和 UI 的唯一来源。它已经实现：
 
-- `/t` LAN Session V10；
+- `/t` LAN Session V11；
 - Supabase Realtime Presence/Broadcast 配对；
 - WebRTC DataChannel；
 - 聊天、附件、进度、取消和同页恢复；
@@ -514,9 +514,10 @@ unbounded channel
 - `winrisef-core`：不依赖 Tokio/Quinn 的协议与调度核心；
 - `winrisef-agent`：唯一的无前端 Agent server；
 - `docs/protocol-v3.md`：当前网页与 Agent 的双方向六 connection WebTransport 兼容 memory benchmark 协议契约；
-- `docs/lna-http-v1.md`：Chrome 142+ 默认 LNA HTTP/TCP memory benchmark API 契约。
+- `docs/lna-http-v1.md`：Chrome 142+ 默认 LNA HTTP/TCP memory benchmark API 契约；
+- `docs/native-file-v1.md`：LAN V11、Bridge V2、正式 LNA/WT 文件协议和文件生命周期契约。
 
-当前实现包含 Chrome 142+ LNA HTTP/1.1/TCP 六 XHR memory benchmark 主路径，以及 WebTransport v3 双方向六条独立 QUIC connection 的兼容 benchmark；Agent 在同一数字端口监听 TCP 与 UDP，使用精确 Origin、严格 CORS/LNA、每 HTTP 请求一张的一次性 ticket、六 active request 上限和有界流式内存。Windows `winrisef://` 回调同时发布 HTTP 与 WebTransport endpoints，本机 Bridge 生命周期和 WebRTC ticket 引导保持不变。LNA `denied` 必须关闭极速模式，只有 permission descriptor 不受支持才用 WebTransport。Rust 仍不提供前端，也不创建第二个原生 client。真实文件 I/O 只有在 LNA memory benchmark 达到 OpenSpeedTest/iperf 性能门后才接入聊天附件；当前仅做静态/编译验证，未由 Codex 启动或实测。
+当前实现保留 Chrome 142+ LNA HTTP/TCP 与六连接 WebTransport memory benchmark，并已增加正式 Native File V1：Bridge V2 系统选取/保存、opaque source、全局单任务、`.part`/sync/原子完成、六 XHR/30MiB LNA 数据面，以及六 connection × 四 lane/64MiB extent 的 WebTransport 回退。网页的 WebRTC V11 仍是唯一控制面；只有 `>=64MiB` 普通文件在 feature flag 开启时进入 native，图片、语音、小文件继续 WebRTC。LNA `denied` 不进入 WebTransport；只有 permission descriptor 不受支持才回退。当前仅做静态/编译验证，未由 Codex 启动 Agent、网页、浏览器或实际传输。
 
 ## 18. Definition of Done
 

@@ -1,139 +1,313 @@
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use web_transport_quinn::{RecvStream, SendStream, Session};
 
-use crate::auth::TicketAuthority;
+use crate::{
+    auth::TicketAuthority,
+    certificate,
+    file_transfer::{FileTransferManager, NativeDataPlane},
+};
 
-const BRIDGE_VERSION: u16 = 1;
-const HELLO_LEN: usize = 32;
-const ACK_LEN: usize = 16;
-const TICKET_REQUEST_LEN: usize = 16;
-const TICKET_RESPONSE_LEN: usize = 40;
-const HELLO_MAGIC: [u8; 8] = *b"WRNFBH01";
-const ACK_MAGIC: [u8; 8] = *b"WRNFBA01";
-const TICKET_REQUEST_MAGIC: [u8; 8] = *b"WRNFTR01";
-const TICKET_RESPONSE_MAGIC: [u8; 8] = *b"WRNFTS01";
+const BRIDGE_VERSION: u16 = 2;
+const MAX_FRAME_BYTES: usize = 64 * 1024;
 const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-pub async fn run_session(session: Session, authority: TicketAuthority) -> anyhow::Result<()> {
-    tracing::info!("Bridge session handler started");
-    tracing::debug!(
-        timeout_seconds = CONTROL_TIMEOUT.as_secs(),
-        "waiting for Bridge bidirectional control stream"
-    );
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum BridgeInput {
+    Hello {
+        version: u16,
+        #[serde(rename = "launchToken")]
+        launch_token: String,
+    },
+    IssueBenchmarkTicket {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+    },
+    SelectFiles {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+    },
+    CreateSendTransfer {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "sourceId")]
+        source_id: String,
+        #[serde(rename = "attachmentId")]
+        attachment_id: String,
+        #[serde(rename = "ownerDeviceId")]
+        owner_device_id: String,
+        #[serde(rename = "peerDeviceId")]
+        peer_device_id: String,
+        #[serde(rename = "dataPlane")]
+        data_plane: NativeDataPlane,
+    },
+    PrepareReceiveTransfer {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "attachmentId")]
+        attachment_id: String,
+        #[serde(rename = "ownerDeviceId")]
+        owner_device_id: String,
+        #[serde(rename = "peerDeviceId")]
+        peer_device_id: String,
+        name: String,
+        #[serde(rename = "totalBytes")]
+        total_bytes: u64,
+        #[serde(rename = "dataPlane")]
+        data_plane: NativeDataPlane,
+    },
+    CancelTransfer {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+    },
+    FinishSendTransfer {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+    },
+    ReleaseSource {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "sourceId")]
+        source_id: String,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum BridgeOutput<'a> {
+    HelloAck {
+        version: u16,
+        accepted: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'a str>,
+    },
+    Response {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
+pub async fn run_session(
+    session: Session,
+    authority: TicketAuthority,
+    files: FileTransferManager,
+) -> anyhow::Result<()> {
     let (mut send, mut recv) = tokio::time::timeout(CONTROL_TIMEOUT, session.accept_bi())
         .await
         .context("timed out waiting for the Bridge control stream")?
         .context("failed to accept the Bridge control stream")?;
-    tracing::info!("accepted Bridge bidirectional control stream");
-    let token = read_hello(&mut recv).await?;
-    tracing::debug!("received structurally valid Bridge hello");
-    let accepted = authority.consume_launch_token(&token)?;
-    send_ack(&mut send, accepted).await?;
-    tracing::info!(accepted, "sent Bridge launch acknowledgement");
-    anyhow::ensure!(accepted, "Bridge launch token was rejected");
+    let hello = read_frame(&mut recv)
+        .await?
+        .context("Bridge stream ended before hello")?;
+    let BridgeInput::Hello {
+        version,
+        launch_token,
+    } = hello
+    else {
+        write_frame(
+            &mut send,
+            &BridgeOutput::HelloAck {
+                version: BRIDGE_VERSION,
+                accepted: false,
+                error: Some("Bridge hello is required"),
+            },
+        )
+        .await?;
+        anyhow::bail!("Bridge first frame was not hello");
+    };
+    let token = parse_hex::<16>(&launch_token).context("invalid Bridge launch token")?;
+    let accepted = version == BRIDGE_VERSION && authority.consume_launch_token(&token)?;
+    write_frame(
+        &mut send,
+        &BridgeOutput::HelloAck {
+            version: BRIDGE_VERSION,
+            accepted,
+            error: (!accepted).then_some("Bridge version or launch token was rejected"),
+        },
+    )
+    .await?;
+    anyhow::ensure!(accepted, "Bridge authentication was rejected");
+    tracing::info!(bridge_version = BRIDGE_VERSION, "Bridge V2 authenticated");
 
+    let mut events = files.subscribe();
     loop {
-        let Some(request) = read_request(&mut recv).await? else {
-            tracing::info!("Bridge control stream reached clean EOF");
-            break;
-        };
-        tracing::debug!(request_id = request, "received peer ticket request");
-        let response = match authority.issue_ticket() {
-            Ok(ticket) => {
-                tracing::debug!(
-                    request_id = request,
-                    expires_at_ms = ticket.expires_at_ms,
-                    "peer ticket request succeeded"
-                );
-                encode_ticket_response(request, 0, ticket.token, ticket.expires_at_ms)
+        tokio::select! {
+            input = read_frame(&mut recv) => {
+                let Some(input) = input? else { break };
+                let (request_id, result) = handle_input(input, &authority, &files).await?;
+                let output = match result {
+                    Ok(result) => BridgeOutput::Response { request_id, ok: true, result: Some(result), error: None },
+                    Err(error) => BridgeOutput::Response { request_id, ok: false, result: None, error: Some(error.to_string()) },
+                };
+                write_frame(&mut send, &output).await?;
             }
-            Err(error) => {
-                tracing::warn!(request_id = request, error = ?error, "failed to issue a peer ticket");
-                encode_ticket_response(request, 1, [0; 16], 0)
+            event = events.recv() => {
+                match event {
+                    Ok(event) => write_frame(&mut send, &event).await?,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "Bridge file event receiver lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
-        };
-        send.write_all(&response)
-            .await
-            .context("failed to write a peer ticket response")?;
-        tracing::trace!(request_id = request, "wrote peer ticket response");
+        }
     }
-    send.finish()
-        .context("failed to finish the Bridge stream")?;
+    files.cancel_all();
+    send.finish().context("failed to finish the Bridge stream")?;
     session.close(0, b"bridge closed");
-    tracing::info!("Bridge WebTransport session closed");
+    tracing::info!("Bridge V2 session closed");
     Ok(())
 }
 
-async fn read_hello(recv: &mut RecvStream) -> anyhow::Result<[u8; 16]> {
-    let mut bytes = [0_u8; HELLO_LEN];
-    recv.read_exact(&mut bytes)
-        .await
-        .context("failed to read the Bridge hello")?;
-    anyhow::ensure!(bytes[0..8] == HELLO_MAGIC, "invalid Bridge hello magic");
-    anyhow::ensure!(
-        u16::from_be_bytes([bytes[8], bytes[9]]) == BRIDGE_VERSION,
-        "unsupported Bridge protocol version"
-    );
-    tracing::trace!(
-        version = u16::from_be_bytes([bytes[8], bytes[9]]),
-        reserved = ?&bytes[10..16],
-        "decoded Bridge hello header"
-    );
-    Ok(bytes[16..32].try_into().expect("fixed Bridge token range"))
+async fn handle_input(
+    input: BridgeInput,
+    authority: &TicketAuthority,
+    files: &FileTransferManager,
+) -> anyhow::Result<(u32, anyhow::Result<Value>)> {
+    let response = match input {
+        BridgeInput::Hello { .. } => anyhow::bail!("Bridge hello cannot be repeated"),
+        BridgeInput::IssueBenchmarkTicket { request_id } => {
+            let result = authority.issue_ticket().and_then(|ticket| {
+                serde_json::to_value(serde_json::json!({
+                    "token": certificate::format_hex(&ticket.token),
+                    "expiresAt": ticket.expires_at_ms,
+                }))
+                .context("failed to encode benchmark ticket")
+            });
+            (request_id, result)
+        }
+        BridgeInput::SelectFiles { request_id } => {
+            let result = files
+                .select_files()
+                .await
+                .and_then(|selected| serde_json::to_value(selected).context("failed to encode selected files"));
+            (request_id, result)
+        }
+        BridgeInput::CreateSendTransfer {
+            request_id,
+            source_id,
+            attachment_id,
+            owner_device_id,
+            peer_device_id,
+            data_plane,
+        } => {
+            let result = files
+                .create_send_transfer(
+                    &source_id,
+                    &attachment_id,
+                    &owner_device_id,
+                    &peer_device_id,
+                    data_plane,
+                )
+                .and_then(|grant| serde_json::to_value(grant).context("failed to encode transfer grant"));
+            (request_id, result)
+        }
+        BridgeInput::PrepareReceiveTransfer {
+            request_id,
+            attachment_id,
+            owner_device_id,
+            peer_device_id,
+            name,
+            total_bytes,
+            data_plane,
+        } => {
+            let result = files
+                .prepare_receive_transfer(
+                    &attachment_id,
+                    &owner_device_id,
+                    &peer_device_id,
+                    &name,
+                    total_bytes,
+                    data_plane,
+                )
+                .await
+                .and_then(|grant| serde_json::to_value(grant).context("failed to encode receive grant"));
+            (request_id, result)
+        }
+        BridgeInput::CancelTransfer {
+            request_id,
+            transfer_id,
+        } => (
+            request_id,
+            files
+                .cancel_transfer(&transfer_id)
+                .map(|()| serde_json::json!({ "cancelled": true })),
+        ),
+        BridgeInput::FinishSendTransfer {
+            request_id,
+            transfer_id,
+        } => (
+            request_id,
+            files
+                .finish_send_transfer(&transfer_id)
+                .map(|()| serde_json::json!({ "finished": true })),
+        ),
+        BridgeInput::ReleaseSource {
+            request_id,
+            source_id,
+        } => (
+            request_id,
+            files
+                .release_source(&source_id)
+                .map(|()| serde_json::json!({ "released": true })),
+        ),
+    };
+    Ok(response)
 }
 
-async fn send_ack(send: &mut SendStream, accepted: bool) -> anyhow::Result<()> {
-    let mut bytes = [0_u8; ACK_LEN];
-    bytes[0..8].copy_from_slice(&ACK_MAGIC);
-    bytes[8..10].copy_from_slice(&BRIDGE_VERSION.to_be_bytes());
-    bytes[10] = u8::from(!accepted);
-    send.write_all(&bytes)
-        .await
-        .context("failed to write the Bridge acknowledgement")
-}
-
-async fn read_request(recv: &mut RecvStream) -> anyhow::Result<Option<u32>> {
-    let mut bytes = [0_u8; TICKET_REQUEST_LEN];
+async fn read_frame(recv: &mut RecvStream) -> anyhow::Result<Option<BridgeInput>> {
+    let mut prefix = [0_u8; 4];
     let Some(first) = recv
-        .read(&mut bytes[..1])
+        .read(&mut prefix[..1])
         .await
-        .context("failed to read a Bridge command")?
+        .context("failed to read a Bridge frame")?
     else {
         return Ok(None);
     };
-    anyhow::ensure!(first == 1, "invalid Bridge command prefix");
-    recv.read_exact(&mut bytes[1..])
+    anyhow::ensure!(first == 1, "invalid Bridge frame prefix");
+    recv.read_exact(&mut prefix[1..])
         .await
-        .context("failed to read a complete Bridge command")?;
-    anyhow::ensure!(
-        bytes[0..8] == TICKET_REQUEST_MAGIC,
-        "invalid Bridge command magic"
-    );
-    anyhow::ensure!(
-        u16::from_be_bytes([bytes[8], bytes[9]]) == BRIDGE_VERSION,
-        "unsupported Bridge command version"
-    );
-    let request_id = u32::from_be_bytes(bytes[12..16].try_into().expect("fixed request id range"));
-    tracing::trace!(
-        request_id,
-        version = u16::from_be_bytes([bytes[8], bytes[9]]),
-        "decoded Bridge ticket command"
-    );
-    Ok(Some(request_id))
+        .context("failed to read a Bridge frame length")?;
+    let len = usize::try_from(u32::from_be_bytes(prefix)).expect("u32 fits usize on supported targets");
+    anyhow::ensure!(len > 0 && len <= MAX_FRAME_BYTES, "Bridge frame length is invalid");
+    let mut bytes = vec![0_u8; len];
+    recv.read_exact(&mut bytes)
+        .await
+        .context("failed to read a complete Bridge frame")?;
+    serde_json::from_slice(&bytes)
+        .context("Bridge frame contains invalid JSON")
+        .map(Some)
 }
 
-fn encode_ticket_response(
-    request_id: u32,
-    status: u8,
-    token: [u8; 16],
-    expires_at_ms: u64,
-) -> [u8; TICKET_RESPONSE_LEN] {
-    let mut bytes = [0_u8; TICKET_RESPONSE_LEN];
-    bytes[0..8].copy_from_slice(&TICKET_RESPONSE_MAGIC);
-    bytes[8..10].copy_from_slice(&BRIDGE_VERSION.to_be_bytes());
-    bytes[10] = status;
-    bytes[12..16].copy_from_slice(&request_id.to_be_bytes());
-    bytes[16..32].copy_from_slice(&token);
-    bytes[32..40].copy_from_slice(&expires_at_ms.to_be_bytes());
-    bytes
+async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec(value).context("failed to encode a Bridge frame")?;
+    anyhow::ensure!(bytes.len() <= MAX_FRAME_BYTES, "Bridge response is too large");
+    let len = u32::try_from(bytes.len()).context("Bridge response length does not fit u32")?;
+    send.write_all(&len.to_be_bytes())
+        .await
+        .context("failed to write a Bridge frame length")?;
+    send.write_all(&bytes)
+        .await
+        .context("failed to write a Bridge frame body")
+}
+
+fn parse_hex<const N: usize>(value: &str) -> anyhow::Result<[u8; N]> {
+    anyhow::ensure!(value.len() == N * 2, "hex value has the wrong length");
+    let mut bytes = [0_u8; N];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .context("hex value is malformed")?;
+    }
+    Ok(bytes)
 }

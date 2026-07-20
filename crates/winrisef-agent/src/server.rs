@@ -9,12 +9,14 @@ use crate::{
     auth::TicketAuthority,
     bridge, certificate,
     cli::ServeArgs,
+    file_transfer::FileTransferManager,
+    file_webtransport::{self, FILE_WEBTRANSPORT_PATH},
     lna_http::{self, LnaHttpSettings},
     transfer::{self, TransferAuthenticator, TransferSettings},
     tuning,
 };
 
-pub const BRIDGE_PATH: &str = "/winrisef/bridge/v1";
+pub const BRIDGE_PATH: &str = "/winrisef/bridge/v2";
 pub const BENCHMARK_PATH: &str = "/winrisef/benchmark/v3";
 
 pub struct LaunchedServerSettings {
@@ -39,6 +41,7 @@ enum ServerMode {
     Launched {
         authority: TicketAuthority,
         shutdown: watch::Sender<bool>,
+        files: FileTransferManager,
     },
 }
 
@@ -52,6 +55,7 @@ struct ServerSettings {
 enum Route {
     Bridge,
     Transfer,
+    NativeFile,
 }
 
 #[derive(Debug)]
@@ -95,6 +99,7 @@ pub async fn run_launched(
 ) -> anyhow::Result<()> {
     validate_origin_list(std::slice::from_ref(&args.allowed_origin))?;
     let authority = args.authority;
+    let files = FileTransferManager::new();
     let (shutdown, shutdown_rx) = watch::channel(false);
     let launch_timeout_authority = authority.clone();
     let launch_timeout_shutdown = shutdown.clone();
@@ -117,12 +122,14 @@ pub async fn run_launched(
         max_transfer_size: args.max_transfer_size,
         max_sessions: args.max_sessions,
         metrics_enabled: args.metrics_enabled,
+        files: files.clone(),
     };
     let settings = ServerSettings {
         allowed_origins: vec![args.allowed_origin],
         mode: ServerMode::Launched {
             authority: authority.clone(),
             shutdown,
+            files,
         },
         transfer: TransferSettings {
             authenticator: TransferAuthenticator::Tickets(authority),
@@ -206,6 +213,7 @@ async fn run_server(
     let settings = Arc::new(settings);
     let transfer_sessions = Arc::new(Semaphore::new(max_sessions));
     let bridge_sessions = Arc::new(Semaphore::new(1));
+    let file_sessions = Arc::new(Semaphore::new(6));
     tracing::info!(
         listen = %local_addr,
         max_transfer_sessions = max_sessions,
@@ -243,12 +251,14 @@ async fn run_server(
         let settings = Arc::clone(&settings);
         let transfer_sessions = Arc::clone(&transfer_sessions);
         let bridge_sessions = Arc::clone(&bridge_sessions);
+        let file_sessions = Arc::clone(&file_sessions);
         tokio::spawn(async move {
             let result = handle_incoming(
                 incoming,
                 settings,
                 transfer_sessions,
                 bridge_sessions,
+                file_sessions,
                 remote,
             )
             .await;
@@ -259,7 +269,11 @@ async fn run_server(
     }
     endpoint.close(0_u32.into(), b"Agent shutdown");
     endpoint.wait_idle().await;
-    if let ServerMode::Launched { shutdown, .. } = &settings.mode {
+    if let ServerMode::Launched {
+        shutdown, files, ..
+    } = &settings.mode
+    {
+        files.cancel_all();
         let _ = shutdown.send(true);
     }
     if let Some(task) = lna_task {
@@ -274,6 +288,7 @@ async fn handle_incoming(
     settings: Arc<ServerSettings>,
     transfer_sessions: Arc<Semaphore>,
     bridge_sessions: Arc<Semaphore>,
+    file_sessions: Arc<Semaphore>,
     remote: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
     let connection = incoming
@@ -324,6 +339,7 @@ async fn handle_incoming(
     let permits = match route {
         Route::Bridge => bridge_sessions,
         Route::Transfer => transfer_sessions,
+        Route::NativeFile => file_sessions,
     };
     let Ok(permit) = permits.try_acquire_owned() else {
         tracing::warn!(%remote, connection_id, ?route, "rejecting WebTransport request while route is busy");
@@ -345,11 +361,12 @@ async fn handle_incoming(
             let ServerMode::Launched {
                 authority,
                 shutdown,
+                files,
             } = &settings.mode
             else {
                 anyhow::bail!("Bridge route is unavailable");
             };
-            let result = bridge::run_session(session, authority.clone()).await;
+            let result = bridge::run_session(session, authority.clone(), files.clone()).await;
             tracing::info!(
                 %remote,
                 connection_id,
@@ -373,6 +390,12 @@ async fn handle_incoming(
                 "memory transfer complete"
             );
             Ok(())
+        }
+        Route::NativeFile => {
+            let ServerMode::Launched { files, .. } = &settings.mode else {
+                anyhow::bail!("Native File route is unavailable");
+            };
+            file_webtransport::run_session(session, files.clone()).await
         }
     }
 }
@@ -398,6 +421,7 @@ fn request_route(
         ServerMode::Manual { path } if request.url.path() == path => Ok(Route::Transfer),
         ServerMode::Launched { .. } if request.url.path() == BRIDGE_PATH => Ok(Route::Bridge),
         ServerMode::Launched { .. } if request.url.path() == BENCHMARK_PATH => Ok(Route::Transfer),
+        ServerMode::Launched { .. } if request.url.path() == FILE_WEBTRANSPORT_PATH => Ok(Route::NativeFile),
         _ => Err(RouteRejection::PathNotAllowed),
     }
 }

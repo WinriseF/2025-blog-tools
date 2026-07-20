@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/winrisef-core", "crates/winrisef-agent"]
+members = ["crates/winrisef-core", "crates/winrisef-agent", "crates/winrisef-platform"]
 resolver = "3"
 
 [workspace.package]
@@ -13,9 +13,13 @@ anyhow = "1.0.103"
 bytes = "1.11.1"
 clap = { version = "4.6.0", features = ["derive"] }
 getrandom = "0.4.3"
+mime_guess = "2.0.5"
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
+rfd = { version = "0.17.2", default-features = false }
 rustls = { version = "0.23.42", default-features = false, features = ["std", "ring"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 sha2 = "0.10.9"
 socket2 = "0.6.1"
 sysinfo = "0.38.4"
@@ -26,6 +30,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 url = "2.5.8"
 web-transport-quinn = { version = "0.11.9", default-features = false, features = ["ring"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+winrisef-platform = { path = "crates/winrisef-platform" }
 
 [profile.release]
 opt-level = 3

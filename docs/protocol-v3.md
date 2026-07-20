@@ -195,13 +195,13 @@ Agent 只接受内置正式 Origin、本机 loopback Origin，或注册 handler 
 
 Agent 只接受 HTTPS return URL，开发环境额外允许 loopback HTTP。回调 fragment 包含 loopback Bridge endpoint、局域网 WebTransport benchmark endpoint、LNA HTTP base endpoint、短期 P-256 证书 SHA-256、一次性 launch token、nonce 和过期时间；query string、日志和 Supabase 中不包含 token。
 
-安装端网页连接 `/winrisef/bridge/v1` 后在首个双向流发送 32-byte `WRNFBH01` hello。launch token 验证成功后只能消费一次。Bridge 使用固定 16-byte `WRNFTR01` request 和 40-byte `WRNFTS01` response 签发 120 秒有效、只能消费一次的 benchmark ticket。v3 的两个方向都必须独立申请六张 ticket。不得把单张 ticket 改成多次可消费。安装端网页通过现有加密 WebRTC DataChannel 把 ticket 交给指定纯网页连接，文件/测速 payload 不经过安装端网页。
+安装端网页连接 `/winrisef/bridge/v2` 后，在首个双向流发送 `4-byte big-endian length + JSON` 的 Bridge V2 hello；单帧最大 64KiB。launch token 验证成功后只能消费一次。网页用 `issue-benchmark-ticket` JSON 命令申请 120 秒有效、只能消费一次的 benchmark ticket。v3 的两个方向都必须独立申请六张 ticket。不得把单张 ticket 改成多次可消费。安装端网页通过现有加密 WebRTC DataChannel 把 ticket 交给指定纯网页连接，文件/测速 payload 不经过安装端网页。正式文件的 Bridge V2 命令与授权见 `native-file-v1.md`。
 
 如果双方都发布本机 Agent capability，网页按稳定 device ID 排序，只保留一端 Agent；不会建立 Agent ↔ Agent。
 
 ## 10. 与后续正式协议的关系
 
-当前 memory ticket 只授权一次内存测速。正式文件数据面仍会加入：
+当前 memory ticket 只授权一次内存测速。正式文件数据面已经由独立的 `native-file-v1.md` 定义并实现：
 
 - attachment manifest；
 - 系统文件选择与 positional I/O；

@@ -9,12 +9,18 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
-use crate::{auth::TicketAuthority, metrics::Monitor};
+use crate::{
+    auth::TicketAuthority,
+    file_http,
+    file_transfer::{FILE_HTTP_PARALLELISM, FileTransferManager},
+    metrics::Monitor,
+};
 
 pub const LNA_HTTP_BASE_PATH: &str = "/winrisef/lna/v1";
 const PROBE_PATH: &str = "/winrisef/lna/v1/probe";
 const BENCHMARK_PATH: &str = "/winrisef/lna/v1/benchmark";
 const TICKET_HEADER: &str = "x-winrisef-ticket";
+const FILE_TOKEN_HEADER: &str = "x-winrisef-transfer-token";
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const IO_BLOCK_BYTES: usize = 1024 * 1024;
 const SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
@@ -30,6 +36,14 @@ pub struct LnaHttpSettings {
     pub max_transfer_size: u64,
     pub max_sessions: usize,
     pub metrics_enabled: bool,
+    pub files: FileTransferManager,
+}
+
+struct LnaHttpRuntime {
+    settings: Arc<LnaHttpSettings>,
+    active_requests: Arc<Semaphore>,
+    file_requests: Arc<Semaphore>,
+    zero_block: Arc<Vec<u8>>,
 }
 
 pub async fn start(
@@ -58,9 +72,16 @@ async fn run(
 ) -> anyhow::Result<()> {
     let settings = Arc::new(settings);
     let active_requests = Arc::new(Semaphore::new(settings.max_sessions));
+    let file_requests = Arc::new(Semaphore::new(FILE_HTTP_PARALLELISM));
     let connection_limit = settings.max_sessions.saturating_mul(4).saturating_add(8);
     let connections = Arc::new(Semaphore::new(connection_limit));
     let zero_block = Arc::new(vec![0_u8; IO_BLOCK_BYTES]);
+    let runtime = Arc::new(LnaHttpRuntime {
+        settings,
+        active_requests,
+        file_requests,
+        zero_block,
+    });
     let mut tasks = JoinSet::new();
 
     loop {
@@ -83,12 +104,10 @@ async fn run(
             }
         };
         tune_socket(&stream, remote);
-        let settings = Arc::clone(&settings);
-        let active_requests = Arc::clone(&active_requests);
-        let zero_block = Arc::clone(&zero_block);
+        let runtime = Arc::clone(&runtime);
         tasks.spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_connection(stream, remote, settings, active_requests, zero_block).await {
+            if let Err(error) = handle_connection(stream, remote, runtime).await {
                 tracing::warn!(%remote, error = ?error, "LNA HTTP/TCP connection ended with an error");
             }
         });
@@ -127,9 +146,7 @@ fn tune_socket(stream: &TcpStream, remote: SocketAddr) {
 async fn handle_connection(
     mut stream: TcpStream,
     remote: SocketAddr,
-    settings: Arc<LnaHttpSettings>,
-    active_requests: Arc<Semaphore>,
-    zero_block: Arc<Vec<u8>>,
+    runtime: Arc<LnaHttpRuntime>,
 ) -> anyhow::Result<()> {
     let mut pending = Vec::with_capacity(MAX_HEADER_BYTES);
     loop {
@@ -154,7 +171,7 @@ async fn handle_connection(
                 Err(_) => return Ok(()),
             };
         let keep_alive = request.keep_alive;
-        let origin_allowed = request.origin.as_deref() == Some(settings.allowed_origin.as_str());
+        let origin_allowed = request.origin.as_deref() == Some(runtime.settings.allowed_origin.as_str());
         if !origin_allowed {
             tracing::warn!(%remote, origin = ?request.origin, "rejected LNA HTTP request from an untrusted Origin");
             write_error(
@@ -173,9 +190,7 @@ async fn handle_connection(
             &mut pending,
             request,
             remote,
-            Arc::clone(&settings),
-            Arc::clone(&active_requests),
-            Arc::clone(&zero_block),
+            &runtime,
         )
         .await;
         if let Err(error) = result {
@@ -193,11 +208,22 @@ async fn route_request(
     pending: &mut Vec<u8>,
     request: HttpRequest,
     remote: SocketAddr,
-    settings: Arc<LnaHttpSettings>,
-    active_requests: Arc<Semaphore>,
-    zero_block: Arc<Vec<u8>>,
+    runtime: &LnaHttpRuntime,
 ) -> anyhow::Result<()> {
+    let settings = &runtime.settings;
     let origin = settings.allowed_origin.as_str();
+    if request.path.starts_with(file_http::FILE_HTTP_BASE_PATH) {
+        return file_http::route(
+            stream,
+            pending,
+            request,
+            remote,
+            origin,
+            Arc::clone(&runtime.file_requests),
+            settings.files.clone(),
+        )
+        .await;
+    }
     if request.method == "OPTIONS" {
         if request.path != PROBE_PATH && request.path != BENCHMARK_PATH {
             write_error(
@@ -358,7 +384,7 @@ async fn route_request(
         .await?;
         return Ok(());
     };
-    let permit = match Arc::clone(&active_requests).try_acquire_owned() {
+    let permit = match Arc::clone(&runtime.active_requests).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             write_error(
@@ -412,7 +438,7 @@ async fn route_request(
             origin,
             request.keep_alive,
             settings.metrics_enabled,
-            zero_block,
+            Arc::clone(&runtime.zero_block),
         )
         .await
     }
@@ -520,15 +546,16 @@ async fn send_benchmark(
 }
 
 #[derive(Debug)]
-struct HttpRequest {
-    method: String,
-    path: String,
-    query: Option<String>,
-    origin: Option<String>,
-    ticket: Option<[u8; 16]>,
-    content_length: Option<u64>,
-    transfer_encoding: bool,
-    keep_alive: bool,
+pub(crate) struct HttpRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) query: Option<String>,
+    pub(crate) origin: Option<String>,
+    pub(crate) ticket: Option<[u8; 16]>,
+    pub(crate) file_token: Option<[u8; 32]>,
+    pub(crate) content_length: Option<u64>,
+    pub(crate) transfer_encoding: bool,
+    pub(crate) keep_alive: bool,
 }
 
 async fn read_request(
@@ -578,6 +605,7 @@ fn parse_request(header: &str) -> anyhow::Result<HttpRequest> {
 
     let mut origin = None;
     let mut ticket = None;
+    let mut file_token = None;
     let mut content_length = None;
     let mut transfer_encoding = false;
     let mut connection_close = false;
@@ -594,7 +622,12 @@ fn parse_request(header: &str) -> anyhow::Result<HttpRequest> {
         let value = value.trim();
         match name.as_str() {
             "origin" => set_once(&mut origin, value.to_owned(), "Origin")?,
-            TICKET_HEADER => set_once(&mut ticket, parse_token(value)?, "ticket")?,
+            TICKET_HEADER => set_once(&mut ticket, parse_hex_token(value, "benchmark ticket")?, "ticket")?,
+            FILE_TOKEN_HEADER => set_once(
+                &mut file_token,
+                parse_hex_token(value, "file transfer token")?,
+                "file transfer token",
+            )?,
             "content-length" => set_once(
                 &mut content_length,
                 value.parse::<u64>().context("Content-Length is invalid")?,
@@ -617,6 +650,7 @@ fn parse_request(header: &str) -> anyhow::Result<HttpRequest> {
         query,
         origin,
         ticket,
+        file_token,
         content_length,
         transfer_encoding,
         keep_alive: !connection_close,
@@ -633,15 +667,16 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn parse_token(value: &str) -> anyhow::Result<[u8; 16]> {
+fn parse_hex_token<const N: usize>(value: &str, label: &str) -> anyhow::Result<[u8; N]> {
     anyhow::ensure!(
-        value.len() == 32,
-        "benchmark ticket must contain 32 hexadecimal characters"
+        value.len() == N * 2,
+        "{label} must contain {} hexadecimal characters",
+        N * 2
     );
-    let mut token = [0_u8; 16];
+    let mut token = [0_u8; N];
     for (index, byte) in token.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .context("benchmark ticket is not hexadecimal")?;
+            .with_context(|| format!("{label} is not hexadecimal"))?;
     }
     Ok(token)
 }
@@ -665,7 +700,7 @@ fn parse_download_bytes(query: Option<&str>) -> anyhow::Result<u64> {
     bytes.context("benchmark download requires a bytes query parameter")
 }
 
-async fn write_preflight(
+pub(crate) async fn write_preflight(
     stream: &mut TcpStream,
     origin: &str,
     keep_alive: bool,
@@ -677,14 +712,14 @@ async fn write_preflight(
         ),
         (
             "Access-Control-Allow-Headers",
-            "Content-Type, X-WinriseF-Ticket".to_owned(),
+            "Content-Type, X-WinriseF-Ticket, X-WinriseF-Transfer-Token".to_owned(),
         ),
         ("Access-Control-Max-Age", "600".to_owned()),
     ];
     write_response(stream, 204, "text/plain", 0, origin, keep_alive, &headers).await
 }
 
-async fn write_error(
+pub(crate) async fn write_error(
     stream: &mut TcpStream,
     status: u16,
     code: &str,
@@ -707,7 +742,7 @@ async fn write_error(
     Ok(())
 }
 
-async fn write_response(
+pub(crate) async fn write_response(
     stream: &mut TcpStream,
     status: u16,
     content_type: &str,
@@ -724,6 +759,7 @@ async fn write_response(
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         413 => "Content Too Large",
         503 => "Service Unavailable",
         _ => "Error",

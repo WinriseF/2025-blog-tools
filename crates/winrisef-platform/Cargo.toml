@@ -1,0 +1,9 @@
+[package]
+name = "winrisef-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+windows-sys.workspace = true
