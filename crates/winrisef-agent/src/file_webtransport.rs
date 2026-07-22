@@ -15,6 +15,7 @@ use crate::file_transfer::{
 pub const FILE_WEBTRANSPORT_PATH: &str = "/winrisef/file/v1";
 const CONTROL_FRAME_MAX_BYTES: usize = 64 * 1024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const EXTENT_HEADER_BYTES: usize = 16;
 const END_OFFSET: u64 = u64::MAX;
 
@@ -61,12 +62,13 @@ enum FileControlOutput<'a> {
 }
 
 pub async fn run_session(session: Session, files: FileTransferManager) -> anyhow::Result<()> {
-    let (mut control_send, mut control_recv) = tokio::time::timeout(CONTROL_TIMEOUT, session.accept_bi())
+    let (mut control_send, mut control_recv) = tokio::time::timeout(AUTH_TIMEOUT, session.accept_bi())
         .await
         .context("timed out waiting for Native File V1 control")?
         .context("failed to accept Native File V1 control")?;
-    let hello = read_control(&mut control_recv)
-        .await?
+    let hello = tokio::time::timeout(AUTH_TIMEOUT, read_control(&mut control_recv))
+        .await
+        .context("timed out waiting for Native File authentication")??
         .context("Native File V1 control ended before hello")?;
     let FileControlInput::Hello {
         version,

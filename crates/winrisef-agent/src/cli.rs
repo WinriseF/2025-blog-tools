@@ -30,7 +30,7 @@ pub enum Command {
 #[derive(Clone, Debug, Args)]
 pub struct ServeArgs {
     /// UDP address for the browser-facing WebTransport endpoint.
-    #[arg(long, default_value = "0.0.0.0:17691")]
+    #[arg(long, default_value = "[::]:17691")]
     pub listen: SocketAddr,
 
     /// Exact browser Origin allowed to create a session. Repeat for development origins.
@@ -64,7 +64,7 @@ pub struct LaunchArgs {
     pub uri: String,
 
     /// Shared numeric port for the TCP/LNA endpoint and UDP/WebTransport endpoints.
-    #[arg(long, default_value = "0.0.0.0:17691")]
+    #[arg(long, default_value = "[::]:17691")]
     pub listen: SocketAddr,
 
     /// Maximum accepted memory benchmark size.

@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context;
-use socket2::SockRef;
+use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -51,9 +51,7 @@ pub async fn start(
     settings: LnaHttpSettings,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
-    let listener = TcpListener::bind(listen)
-        .await
-        .with_context(|| format!("failed to bind the LNA HTTP/TCP endpoint at {listen}"))?;
+    let listener = bind_tcp_listener(listen)?;
     let local_addr = listener.local_addr()?;
     tracing::info!(
         listen = %local_addr,
@@ -63,6 +61,22 @@ pub async fn start(
         "LNA HTTP/TCP endpoint is ready"
     );
     Ok(tokio::spawn(run(listener, settings, shutdown)))
+}
+
+fn bind_tcp_listener(listen: SocketAddr) -> anyhow::Result<TcpListener> {
+    let socket = Socket::new(Domain::for_address(listen), Type::STREAM, Some(Protocol::TCP))
+        .with_context(|| format!("failed to create the LNA HTTP/TCP socket at {listen}"))?;
+    if listen.is_ipv6() {
+        socket
+            .set_only_v6(false)
+            .context("failed to enable dual-stack TCP on the Agent socket")?;
+    }
+    socket
+        .bind(&SockAddr::from(listen))
+        .with_context(|| format!("failed to bind the LNA HTTP/TCP endpoint at {listen}"))?;
+    socket.listen(128)?;
+    socket.set_nonblocking(true)?;
+    Ok(TcpListener::from_std(socket.into())?)
 }
 
 async fn run(
@@ -734,6 +748,21 @@ pub(crate) async fn write_response(
 #[cfg(test)]
 mod tests {
     use super::{BENCHMARK_PATH, parse_download_bytes, parse_request};
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn ipv6_wildcard_tcp_listener_accepts_both_families() {
+        let listener = super::bind_tcp_listener("[::]:0".parse().unwrap()).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            listener.accept().await.unwrap();
+            listener.accept().await.unwrap();
+        });
+        let ipv4 = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let ipv6 = tokio::net::TcpStream::connect(("::1", port)).await.unwrap();
+        accept.await.unwrap();
+        drop((ipv4, ipv6));
+    }
 
     #[test]
     fn parses_bounded_benchmark_upload() {

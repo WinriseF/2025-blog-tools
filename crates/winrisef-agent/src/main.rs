@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod auth;
@@ -10,9 +10,12 @@ mod diagnostics;
 mod file_transfer;
 mod file_http;
 mod file_webtransport;
+mod firewall;
 mod launch;
 mod lna_http;
 mod metrics;
+#[allow(unsafe_code)]
+mod network_endpoints;
 mod protocol_registration;
 mod server;
 mod transfer;

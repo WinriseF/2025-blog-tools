@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr},
     process::Command,
     time::Duration,
 };
@@ -12,8 +12,10 @@ use crate::{
     certificate,
     cli::LaunchArgs,
     file_http::FILE_HTTP_BASE_PATH,
-    lna_http::LNA_HTTP_BASE_PATH,
     file_webtransport::FILE_WEBTRANSPORT_PATH,
+    firewall,
+    lna_http::LNA_HTTP_BASE_PATH,
+    network_endpoints::{self, NetworkEndpoints},
     server::{self, BENCHMARK_PATH, BRIDGE_PATH, LaunchedServerSettings, ReadyInfo},
 };
 
@@ -36,13 +38,20 @@ pub async fn run(args: LaunchArgs) -> anyhow::Result<()> {
         "processing browser protocol activation"
     );
     let activation = parse_activation(&args.uri, &args.trusted_origins)?;
-    let lan_ips = discover_lan_ips();
+    let network_endpoints = network_endpoints::discover();
+    if network_endpoints.has_public_ipv6()
+        && let Err(error) = firewall::ensure_inbound_rules(args.listen.port())
+    {
+        tracing::warn!(error = ?error, "public IPv6 firewall authorization was not completed; WebRTC fallback remains available");
+    }
     tracing::info!(
         allowed_origin = %activation.allowed_origin,
         return_scheme = activation.return_url.scheme(),
         return_host = ?activation.return_url.host_str(),
         return_path = activation.return_url.path(),
-        lan_ip_count = lan_ips.len(),
+        private_http_endpoint_count = network_endpoints.http_ips.len(),
+        webtransport_endpoint_count = network_endpoints.webtransport_ips.len(),
+        network_epoch = network_endpoints.network_epoch,
         "browser activation validated"
     );
     let launch_token = random_token()?;
@@ -53,14 +62,14 @@ pub async fn run(args: LaunchArgs) -> anyhow::Result<()> {
         "created one-time launch authority"
     );
     let authority = TicketAuthority::new(launch_token, launch_expires_at_ms);
-    let callback_ips = lan_ips.clone();
+    let callback_endpoints = network_endpoints.clone();
     let return_url = activation.return_url;
     let nonce = activation.nonce;
     server::run_launched(
         LaunchedServerSettings {
             listen: args.listen,
             allowed_origin: activation.allowed_origin,
-            certificate_ips: lan_ips,
+            certificate_ips: Vec::new(),
             authority,
             max_transfer_size: args.max_transfer_size,
             max_sessions: args.max_sessions,
@@ -70,14 +79,15 @@ pub async fn run(args: LaunchArgs) -> anyhow::Result<()> {
             tracing::info!(
                 port = ready.port,
                 certificate_sha256 = %ready.certificate_sha256,
-                callback_lan_endpoint_count = callback_ips.len(),
+                callback_http_endpoint_count = callback_endpoints.http_ips.len(),
+                callback_webtransport_endpoint_count = callback_endpoints.webtransport_ips.len(),
                 "Agent endpoint is ready; building browser callback"
             );
             let callback = build_callback_url(
                 return_url,
                 &nonce,
                 ready,
-                &callback_ips,
+                &callback_endpoints,
                 &launch_token,
                 launch_expires_at_ms,
             );
@@ -93,10 +103,7 @@ pub async fn run(args: LaunchArgs) -> anyhow::Result<()> {
     .await
 }
 
-fn parse_activation(
-    value: &str,
-    additional_trusted_origins: &[String],
-) -> anyhow::Result<Activation> {
+fn parse_activation(value: &str, additional_trusted_origins: &[String]) -> anyhow::Result<Activation> {
     tracing::trace!(
         activation_length = value.len(),
         "parsing winrisef protocol activation"
@@ -115,21 +122,14 @@ fn parse_activation(
             _ => {}
         }
     }
-    let mut return_url = Url::parse(
-        return_url
-            .as_deref()
-            .context("activation is missing returnUrl")?,
-    )
-    .context("invalid browser return URL")?;
+    let mut return_url = Url::parse(return_url.as_deref().context("activation is missing returnUrl")?)
+        .context("invalid browser return URL")?;
     anyhow::ensure!(
         return_url.username().is_empty() && return_url.password().is_none(),
         "browser return URL must not contain credentials"
     );
     let secure = return_url.scheme() == "https";
-    let loopback = matches!(
-        return_url.host_str(),
-        Some("localhost" | "127.0.0.1" | "::1")
-    );
+    let loopback = matches!(return_url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
     anyhow::ensure!(
         secure || (return_url.scheme() == "http" && loopback),
         "browser return URL is not secure"
@@ -171,7 +171,7 @@ fn build_callback_url(
     mut return_url: Url,
     nonce: &str,
     ready: &ReadyInfo,
-    lan_ips: &[IpAddr],
+    endpoints: &NetworkEndpoints,
     launch_token: &[u8; 16],
     launch_expires_at_ms: u64,
 ) -> Url {
@@ -183,20 +183,14 @@ fn build_callback_url(
     fragment.append_pair("certificate", &ready.certificate_sha256);
     fragment.append_pair("token", &certificate::format_hex(launch_token));
     fragment.append_pair("expires", &launch_expires_at_ms.to_string());
-    for ip in lan_ips {
+    fragment.append_pair("network-epoch", &format!("{:016x}", endpoints.network_epoch));
+    for ip in &endpoints.webtransport_ips {
         fragment.append_pair("lan", &endpoint(*ip, ready.port, BENCHMARK_PATH));
-        fragment.append_pair(
-            "lan-http",
-            &http_endpoint(*ip, ready.port, LNA_HTTP_BASE_PATH),
-        );
-        fragment.append_pair(
-            "file-http",
-            &http_endpoint(*ip, ready.port, FILE_HTTP_BASE_PATH),
-        );
-        fragment.append_pair(
-            "file-wt",
-            &endpoint(*ip, ready.port, FILE_WEBTRANSPORT_PATH),
-        );
+        fragment.append_pair("file-wt", &endpoint(*ip, ready.port, FILE_WEBTRANSPORT_PATH));
+    }
+    for ip in &endpoints.http_ips {
+        fragment.append_pair("lan-http", &http_endpoint(*ip, ready.port, LNA_HTTP_BASE_PATH));
+        fragment.append_pair("file-http", &http_endpoint(*ip, ready.port, FILE_HTTP_BASE_PATH));
     }
     return_url.set_fragment(Some(&fragment.finish()));
     return_url
@@ -214,24 +208,6 @@ fn endpoint(ip: IpAddr, port: u16, path: &str) -> String {
         IpAddr::V4(ip) => format!("https://{ip}:{port}{path}"),
         IpAddr::V6(ip) => format!("https://[{ip}]:{port}{path}"),
     }
-}
-
-fn discover_lan_ips() -> Vec<IpAddr> {
-    let mut ips = Vec::new();
-    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0")
-        && socket.connect("1.1.1.1:80").is_ok()
-        && let Ok(SocketAddr::V4(address)) = socket.local_addr()
-        && !address.ip().is_loopback()
-    {
-        ips.push(IpAddr::V4(*address.ip()));
-    }
-    tracing::debug!(
-        discovered_count = ips.len(),
-        has_ipv4 = ips.iter().any(IpAddr::is_ipv4),
-        has_ipv6 = ips.iter().any(IpAddr::is_ipv6),
-        "completed LAN route discovery"
-    );
-    ips
 }
 
 #[cfg(target_os = "windows")]

@@ -2143,6 +2143,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "web-transport-quinn",
+ "windows-sys 0.61.2",
  "winrisef-core",
  "winrisef-platform",
 ]

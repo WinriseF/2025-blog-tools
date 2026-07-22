@@ -1,6 +1,7 @@
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
-use socket2::SockRef;
+use anyhow::Context;
+use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
 
 const SOCKET_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 const CONNECTION_WINDOW: u64 = 128 * 1024 * 1024;
@@ -44,7 +45,7 @@ pub fn endpoint(
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     server_config.transport_config(Arc::new(transport));
 
-    let socket = std::net::UdpSocket::bind(listen)?;
+    let socket = bind_udp_socket(listen)?;
     socket.set_nonblocking(true)?;
     tracing::info!(local_addr = %socket.local_addr()?, "bound Agent UDP socket");
     tune_udp_socket(&socket);
@@ -55,6 +56,17 @@ pub fn endpoint(
         socket,
         Arc::new(quinn::TokioRuntime),
     )?)
+}
+
+fn bind_udp_socket(listen: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
+    let socket = Socket::new(Domain::for_address(listen), Type::DGRAM, Some(Protocol::UDP))?;
+    if listen.is_ipv6() {
+        socket
+            .set_only_v6(false)
+            .context("failed to enable dual-stack UDP on the Agent socket")?;
+    }
+    socket.bind(&SockAddr::from(listen))?;
+    Ok(socket.into())
 }
 
 fn tune_udp_socket(socket: &std::net::UdpSocket) {
@@ -92,6 +104,31 @@ fn log_tuning_result(direction: &'static str, result: io::Result<()>) {
         ),
         Err(error) => {
             tracing::warn!(%error, direction, requested_bytes = SOCKET_BUFFER_SIZE, "could not enlarge UDP socket buffer");
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::bind_udp_socket;
+    use std::{net::UdpSocket, time::Duration};
+
+    #[test]
+    fn ipv6_wildcard_udp_socket_accepts_both_families() {
+        let receiver = bind_udp_socket("[::]:0".parse().unwrap()).unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let port = receiver.local_addr().unwrap().port();
+        for target in [format!("127.0.0.1:{port}"), format!("[::1]:{port}")] {
+            let sender = UdpSocket::bind(if target.starts_with('[') {
+                "[::1]:0"
+            } else {
+                "127.0.0.1:0"
+            })
+            .unwrap();
+            sender.send_to(b"dual-stack", target).unwrap();
+            let mut bytes = [0_u8; 16];
+            let (count, _) = receiver.recv_from(&mut bytes).unwrap();
+            assert_eq!(&bytes[..count], b"dual-stack");
         }
     }
 }

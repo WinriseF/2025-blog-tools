@@ -22,6 +22,7 @@ pub const LANE_COUNT: usize = 4;
 pub const BLOCK_SIZE: usize = 4 * 1024 * 1024;
 pub const EXTENT_SIZE: u64 = 16 * 1024 * 1024;
 const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct TransferSettings {
@@ -59,13 +60,15 @@ pub async fn run_session(
         "waiting for transfer control stream"
     );
     let (mut control_send, mut control_recv) =
-        tokio::time::timeout(CONTROL_TIMEOUT, session.accept_bi())
+        tokio::time::timeout(AUTH_TIMEOUT, session.accept_bi())
             .await
             .context("timed out waiting for the control stream")?
             .context("failed to accept the control stream")?;
     tracing::info!("accepted transfer bidirectional control stream");
 
-    let hello = read_hello(&mut control_recv).await?;
+    let hello = tokio::time::timeout(AUTH_TIMEOUT, read_hello(&mut control_recv))
+        .await
+        .context("timed out waiting for transfer authentication")??;
     tracing::info!(
         direction = ?hello.direction,
         lanes = hello.lanes,

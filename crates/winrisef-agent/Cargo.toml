@@ -27,5 +27,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 web-transport-quinn.workspace = true
+windows-sys.workspace = true
 winrisef-platform.workspace = true
 winrisef-core = { path = "../winrisef-core" }

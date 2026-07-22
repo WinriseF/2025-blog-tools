@@ -1,4 +1,8 @@
-use std::{net::IpAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::Context;
 use rustls::version::TLS13;
@@ -16,7 +20,7 @@ use crate::{
     tuning,
 };
 
-pub const BRIDGE_PATH: &str = "/winrisef/bridge/v2";
+pub const BRIDGE_PATH: &str = "/winrisef/bridge/v3";
 pub const BENCHMARK_PATH: &str = "/winrisef/benchmark/v3";
 
 pub struct LaunchedServerSettings {
@@ -49,6 +53,53 @@ struct ServerSettings {
     allowed_origins: Vec<String>,
     mode: ServerMode,
     transfer: TransferSettings,
+}
+
+struct IpConnectionTracker {
+    counts: Mutex<HashMap<IpAddr, usize>>,
+    limit: usize,
+}
+
+struct IpConnectionPermit {
+    tracker: Arc<IpConnectionTracker>,
+    address: IpAddr,
+}
+
+impl IpConnectionTracker {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            counts: Mutex::new(HashMap::new()),
+            limit,
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>, address: IpAddr) -> Option<IpConnectionPermit> {
+        let mut counts = self.counts.lock().ok()?;
+        let count = counts.entry(address).or_default();
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(IpConnectionPermit {
+            tracker: Arc::clone(self),
+            address,
+        })
+    }
+}
+
+impl Drop for IpConnectionPermit {
+    fn drop(&mut self) {
+        let Ok(mut counts) = self.tracker.counts.lock() else {
+            return;
+        };
+        let Some(count) = counts.get_mut(&self.address) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(&self.address);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -213,6 +264,8 @@ async fn run_server(
     let transfer_sessions = Arc::new(Semaphore::new(max_sessions));
     let bridge_sessions = Arc::new(Semaphore::new(1));
     let file_sessions = Arc::new(Semaphore::new(FILE_WEBTRANSPORT_CONNECTIONS));
+    let pending_sessions = Arc::new(Semaphore::new(max_sessions.saturating_mul(4).saturating_add(16)));
+    let per_ip_sessions = IpConnectionTracker::new(12);
     tracing::info!(
         listen = %local_addr,
         max_transfer_sessions = max_sessions,
@@ -241,6 +294,14 @@ async fn run_server(
         let remote = incoming.remote_address();
         let local_ip = incoming.local_ip();
         let address_validated = incoming.remote_address_validated();
+        if !address_validated {
+            let family = if remote.is_ipv6() { "ipv6" } else { "ipv4" };
+            incoming
+                .retry()
+                .map_err(|_| anyhow::anyhow!("failed to send QUIC Retry"))?;
+            tracing::debug!(address_family = family, "required QUIC address validation");
+            continue;
+        }
         tracing::info!(
             %remote,
             ?local_ip,
@@ -251,7 +312,24 @@ async fn run_server(
         let transfer_sessions = Arc::clone(&transfer_sessions);
         let bridge_sessions = Arc::clone(&bridge_sessions);
         let file_sessions = Arc::clone(&file_sessions);
+        let Ok(pending_permit) = Arc::clone(&pending_sessions).try_acquire_owned() else {
+            tracing::warn!(
+                address_family = if remote.is_ipv6() { "ipv6" } else { "ipv4" },
+                "rejecting excess pending QUIC connection"
+            );
+            continue;
+        };
+        let Some(ip_permit) = per_ip_sessions.try_acquire(remote.ip()) else {
+            tracing::warn!(
+                address_family = if remote.is_ipv6() { "ipv6" } else { "ipv4" },
+                per_ip_limit = 12,
+                "rejecting excess QUIC connections from one address"
+            );
+            continue;
+        };
         tokio::spawn(async move {
+            let _pending_permit = pending_permit;
+            let _ip_permit = ip_permit;
             let result = handle_incoming(
                 incoming,
                 settings,
@@ -259,6 +337,7 @@ async fn run_server(
                 bridge_sessions,
                 file_sessions,
                 remote,
+                local_addr.port(),
             )
             .await;
             if let Err(error) = result {
@@ -286,9 +365,11 @@ async fn handle_incoming(
     bridge_sessions: Arc<Semaphore>,
     file_sessions: Arc<Semaphore>,
     remote: std::net::SocketAddr,
+    port: u16,
 ) -> anyhow::Result<()> {
-    let connection = incoming
+    let connection = tokio::time::timeout(std::time::Duration::from_secs(5), incoming)
         .await
+        .context("QUIC TLS handshake timed out before authentication")?
         .context("QUIC TLS handshake failed before HTTP/3 negotiation")?;
     let connection_id = connection.stable_id();
     tracing::info!(
@@ -297,9 +378,13 @@ async fn handle_incoming(
         local_ip = ?connection.local_ip(),
         "QUIC TLS handshake completed"
     );
-    let request = web_transport_quinn::Request::accept(connection)
-        .await
-        .context("HTTP/3 settings or WebTransport CONNECT handshake failed")?;
+    let request = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        web_transport_quinn::Request::accept(connection),
+    )
+    .await
+    .context("HTTP/3 WebTransport handshake timed out before authentication")?
+    .context("HTTP/3 settings or WebTransport CONNECT handshake failed")?;
     let origin = request
         .headers
         .get("origin")
@@ -362,7 +447,7 @@ async fn handle_incoming(
             else {
                 anyhow::bail!("Bridge route is unavailable");
             };
-            let result = bridge::run_session(session, authority.clone(), files.clone()).await;
+            let result = bridge::run_session(session, authority.clone(), files.clone(), port).await;
             tracing::info!(
                 %remote,
                 connection_id,

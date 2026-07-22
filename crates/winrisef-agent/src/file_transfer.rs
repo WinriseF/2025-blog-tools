@@ -957,8 +957,8 @@ mod tests {
     fn native_file_fixture_matches_rust_constants() {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../../../protocol-fixtures/native-file-v1.json")).unwrap();
-        assert_eq!(fixture["lanSessionVersion"], 11);
-        assert_eq!(fixture["bridgeVersion"], 2);
+        assert_eq!(fixture["lanSessionVersion"], 12);
+        assert_eq!(fixture["bridgeVersion"], 3);
         assert_eq!(fixture["fileVersion"], super::NATIVE_FILE_VERSION);
         assert_eq!(fixture["lnaHttp"]["segmentBytes"], super::FILE_HTTP_SEGMENT_BYTES);
         assert_eq!(fixture["lnaHttp"]["parallelism"], super::FILE_HTTP_PARALLELISM);
