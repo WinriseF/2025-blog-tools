@@ -105,6 +105,8 @@ Agent 不提供网页、WebView、桌面 UI 或独立聊天界面。允许的用
 - bridge 版本握手；
 - Agent capability。
 
+Windows `launch` 必须先绑定 UDP/TCP、打开 HTTPS fragment 回调并允许 loopback Bridge 鉴权，再异步检查或申请公网 IPv6 防火墙规则。防火墙 UAC 不得阻塞本机 Bridge 启动；私有 IPv4、CGNAT 和 ULA endpoint 可先发布，GUA IPv6 只有在规则状态为 `available` 后才能进入 Bridge V3 endpoint snapshot。一次用户会话只能存在一个 protocol-launch Agent，重复启动不得竞争固定端口或覆盖仍有效的 launch nonce。
+
 不负责文件传输协议或聊天业务。
 
 ### 4.2 Peer Authorization
@@ -519,7 +521,7 @@ unbounded channel
 - `docs/lna-http-v1.md`：Chrome 142+ 默认 LNA HTTP/TCP memory benchmark API 契约；
 - `docs/native-file-v1.md`：LAN V11、Bridge V2、正式 LNA/WT 文件协议和文件生命周期契约。
 
-当前实现保留 Chrome 142+ LNA HTTP/TCP 与六连接 WebTransport memory benchmark，并已增加正式 Native File V1：Bridge V2 系统选取/保存、opaque source、全局单任务、`.part`/sync/原子完成、六 XHR/30MiB LNA 数据面，以及六 connection × 四 lane/64MiB extent 的 WebTransport 回退。网页的 WebRTC V11 仍是唯一控制面；只有 `>=64MiB` 普通文件在 feature flag 开启时进入 native，图片、语音、小文件继续 WebRTC。LNA `denied` 不进入 WebTransport；只有 permission descriptor 不受支持才回退。当前仅做静态/编译验证，未由 Codex 启动 Agent、网页、浏览器或实际传输。
+当前实现保留 Chrome 142+ LNA HTTP/TCP 与六连接 WebTransport memory benchmark，并已增加正式 Native File V1：Bridge V3 系统选取/保存、动态 endpoint snapshot、opaque source、全局单任务、`.part`/sync/原子完成、六 XHR/30MiB LNA 数据面，以及六 connection × 四 lane/64MiB extent 的 WebTransport 回退。Windows protocol launch 使用单实例互斥；本机 Bridge 先启动，公网 IPv6 防火墙授权随后异步完成，GUA endpoint 只在授权成功后发布。网页的 WebRTC V12 仍是唯一控制面；只有 `>=64MiB` 普通文件进入 native，图片、语音、小文件继续 WebRTC。LNA `denied` 不阻止已授权的公网 IPv6 WebTransport；其他路径失败保持 WebRTC 回退。当前仅做静态/编译验证，未由 Codex 启动 Agent、网页、浏览器或实际传输。
 
 ## 18. Definition of Done
 

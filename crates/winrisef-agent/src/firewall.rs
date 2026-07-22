@@ -1,11 +1,12 @@
 #[cfg(target_os = "windows")]
 pub fn ensure_inbound_rules(port: u16) -> anyhow::Result<()> {
-    use std::{os::windows::process::CommandExt, process::Command};
+    use std::{os::windows::process::CommandExt, process::Command, time::Instant};
 
     use anyhow::Context;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let executable = std::env::current_exe().context("failed to resolve the Agent executable path")?;
+    let executable =
+        std::env::current_exe().context("failed to resolve the Agent executable path")?;
     let executable = executable
         .to_str()
         .context("Agent executable path is not valid Unicode")?;
@@ -17,7 +18,14 @@ pub fn ensure_inbound_rules(port: u16) -> anyhow::Result<()> {
          $programs = @($rules | Get-NetFirewallApplicationFilter | Where-Object {{ $_.Program -eq '{path}' }}); \
          if ($rules.Count -ge 2 -and $programs.Count -ge 2) {{ exit 0 }} else {{ exit 1 }}"
     );
+    let query_started = Instant::now();
     let status = hidden_powershell().arg("-Command").arg(query).status()?;
+    tracing::debug!(
+        port,
+        elapsed_ms = query_started.elapsed().as_millis(),
+        exists = status.success(),
+        "completed the Windows Firewall rule query"
+    );
     if status.success() {
         tracing::debug!(port, "required Windows Firewall rules already exist");
         return Ok(());
@@ -33,6 +41,7 @@ pub fn ensure_inbound_rules(port: u16) -> anyhow::Result<()> {
     let elevate = format!(
         "$process = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{encoded}'; exit $process.ExitCode"
     );
+    let elevation_started = Instant::now();
     let status = hidden_powershell()
         .arg("-Command")
         .arg(elevate)
@@ -44,6 +53,7 @@ pub fn ensure_inbound_rules(port: u16) -> anyhow::Result<()> {
     );
     tracing::info!(
         port,
+        elevation_elapsed_ms = elevation_started.elapsed().as_millis(),
         "installed path-scoped UDP and LocalSubnet TCP inbound firewall rules"
     );
     return Ok(());
@@ -69,7 +79,8 @@ pub fn ensure_inbound_rules(port: u16) -> anyhow::Result<()> {
     }
 
     fn base64(bytes: &[u8]) -> String {
-        const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
         for chunk in bytes.chunks(3) {
             let value = (u32::from(chunk[0]) << 16)

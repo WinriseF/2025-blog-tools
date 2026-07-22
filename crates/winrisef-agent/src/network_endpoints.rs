@@ -5,11 +5,11 @@ use std::{
 };
 
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::{
-    file_http::FILE_HTTP_BASE_PATH, file_webtransport::FILE_WEBTRANSPORT_PATH, lna_http::LNA_HTTP_BASE_PATH,
-    server::BENCHMARK_PATH,
+    file_http::FILE_HTTP_BASE_PATH, file_webtransport::FILE_WEBTRANSPORT_PATH,
+    lna_http::LNA_HTTP_BASE_PATH, server::BENCHMARK_PATH,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -23,6 +23,99 @@ impl NetworkEndpoints {
     pub fn has_public_ipv6(&self) -> bool {
         self.webtransport_ips.iter().any(is_public_ipv6)
     }
+
+    pub fn published(
+        &self,
+        port: u16,
+        public_ipv6_state: PublicIpv6State,
+    ) -> PublishedNetworkEndpoints {
+        let allow_public_ipv6 = public_ipv6_state == PublicIpv6State::Available;
+        let webtransport_ips = self
+            .webtransport_ips
+            .iter()
+            .copied()
+            .filter(|ip| allow_public_ipv6 || !is_public_ipv6(ip))
+            .collect::<Vec<_>>();
+        let mut hasher = DefaultHasher::new();
+        self.http_ips.hash(&mut hasher);
+        webtransport_ips.hash(&mut hasher);
+        let network_epoch = hasher.finish();
+        PublishedNetworkEndpoints {
+            network_epoch: format!("{network_epoch:016x}"),
+            benchmark_endpoints: webtransport_ips
+                .iter()
+                .map(|ip| https_endpoint(*ip, port, BENCHMARK_PATH))
+                .collect(),
+            lna_http_endpoints: self
+                .http_ips
+                .iter()
+                .map(|ip| http_endpoint(*ip, port, LNA_HTTP_BASE_PATH))
+                .collect(),
+            file_http_endpoints: self
+                .http_ips
+                .iter()
+                .map(|ip| http_endpoint(*ip, port, FILE_HTTP_BASE_PATH))
+                .collect(),
+            file_web_transport_endpoints: webtransport_ips
+                .iter()
+                .map(|ip| https_endpoint(*ip, port, FILE_WEBTRANSPORT_PATH))
+                .collect(),
+            public_ipv6_state,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PublicIpv6State {
+    #[default]
+    NotPresent,
+    Authorizing,
+    Available,
+    Unavailable,
+}
+
+impl PublicIpv6State {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotPresent => "not-present",
+            Self::Authorizing => "authorizing",
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct EndpointPolicy {
+    public_ipv6_state: watch::Sender<PublicIpv6State>,
+}
+
+impl EndpointPolicy {
+    pub fn new(public_ipv6_state: PublicIpv6State) -> Self {
+        let (public_ipv6_state, _) = watch::channel(public_ipv6_state);
+        Self { public_ipv6_state }
+    }
+
+    pub fn public_ipv6_state(&self) -> PublicIpv6State {
+        *self.public_ipv6_state.borrow()
+    }
+
+    pub fn set_public_ipv6_state(&self, state: PublicIpv6State) {
+        if self.public_ipv6_state() == state {
+            return;
+        }
+        self.public_ipv6_state.send_replace(state);
+        tracing::info!(?state, "public IPv6 endpoint availability changed");
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<PublicIpv6State> {
+        self.public_ipv6_state.subscribe()
+    }
+
+    pub fn published(&self, port: u16) -> PublishedNetworkEndpoints {
+        discover().published(port, self.public_ipv6_state())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -33,13 +126,18 @@ pub struct PublishedNetworkEndpoints {
     pub lna_http_endpoints: Vec<String>,
     pub file_http_endpoints: Vec<String>,
     pub file_web_transport_endpoints: Vec<String>,
+    pub public_ipv6_state: PublicIpv6State,
 }
 
 impl NetworkEndpoints {
     fn from_ips(mut ips: Vec<IpAddr>) -> Self {
         ips.sort_unstable();
         ips.dedup();
-        let http_ips = ips.iter().copied().filter(is_private_http_address).collect();
+        let http_ips = ips
+            .iter()
+            .copied()
+            .filter(is_private_http_address)
+            .collect();
         let webtransport_ips = ips
             .into_iter()
             .filter(is_webtransport_address)
@@ -69,33 +167,6 @@ pub fn discover() -> NetworkEndpoints {
         "discovered publishable Agent network endpoints"
     );
     endpoints
-}
-
-pub fn published(port: u16) -> PublishedNetworkEndpoints {
-    let endpoints = discover();
-    PublishedNetworkEndpoints {
-        network_epoch: format!("{:016x}", endpoints.network_epoch),
-        benchmark_endpoints: endpoints
-            .webtransport_ips
-            .iter()
-            .map(|ip| https_endpoint(*ip, port, BENCHMARK_PATH))
-            .collect(),
-        lna_http_endpoints: endpoints
-            .http_ips
-            .iter()
-            .map(|ip| http_endpoint(*ip, port, LNA_HTTP_BASE_PATH))
-            .collect(),
-        file_http_endpoints: endpoints
-            .http_ips
-            .iter()
-            .map(|ip| http_endpoint(*ip, port, FILE_HTTP_BASE_PATH))
-            .collect(),
-        file_web_transport_endpoints: endpoints
-            .webtransport_ips
-            .iter()
-            .map(|ip| https_endpoint(*ip, port, FILE_WEBTRANSPORT_PATH))
-            .collect(),
-    }
 }
 
 pub struct NetworkChangeWatcher {
@@ -345,7 +416,9 @@ fn platform_addresses() -> anyhow::Result<Vec<IpAddr>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NetworkEndpoints, is_private_http_address, is_webtransport_address};
+    use super::{
+        NetworkEndpoints, PublicIpv6State, is_private_http_address, is_webtransport_address,
+    };
     use std::net::IpAddr;
 
     fn ip(value: &str) -> IpAddr {
@@ -395,5 +468,25 @@ mod tests {
             assert!(!is_private_http_address(&ip(value)), "{value}");
             assert!(!is_webtransport_address(&ip(value)), "{value}");
         }
+    }
+
+    #[test]
+    fn withholds_public_ipv6_until_firewall_authorization_completes() {
+        let endpoints =
+            NetworkEndpoints::from_ips(vec![ip("192.168.1.4"), ip("2408:8207:1234::8")]);
+        let pending = endpoints.published(17691, PublicIpv6State::Authorizing);
+        assert_eq!(pending.public_ipv6_state, PublicIpv6State::Authorizing);
+        assert_eq!(pending.benchmark_endpoints.len(), 1);
+        assert!(pending.benchmark_endpoints[0].contains("192.168.1.4"));
+
+        let available = endpoints.published(17691, PublicIpv6State::Available);
+        assert_eq!(available.benchmark_endpoints.len(), 2);
+        assert!(
+            available
+                .benchmark_endpoints
+                .iter()
+                .any(|endpoint| endpoint.contains("2408:8207:1234::8"))
+        );
+        assert_ne!(pending.network_epoch, available.network_epoch);
     }
 }

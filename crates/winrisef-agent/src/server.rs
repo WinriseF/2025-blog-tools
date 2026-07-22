@@ -16,6 +16,7 @@ use crate::{
     file_transfer::{FILE_WEBTRANSPORT_CONNECTIONS, FileTransferManager},
     file_webtransport::{self, FILE_WEBTRANSPORT_PATH},
     lna_http::{self, LnaHttpSettings},
+    network_endpoints::EndpointPolicy,
     transfer::{self, TransferAuthenticator, TransferSettings},
     tuning,
 };
@@ -28,6 +29,7 @@ pub struct LaunchedServerSettings {
     pub allowed_origin: String,
     pub certificate_ips: Vec<IpAddr>,
     pub authority: TicketAuthority,
+    pub endpoint_policy: EndpointPolicy,
     pub max_transfer_size: u64,
     pub max_sessions: usize,
     pub metrics_enabled: bool,
@@ -46,6 +48,7 @@ enum ServerMode {
         authority: TicketAuthority,
         shutdown: watch::Sender<bool>,
         files: FileTransferManager,
+        endpoint_policy: EndpointPolicy,
     },
 }
 
@@ -181,6 +184,7 @@ pub async fn run_launched(
             authority: authority.clone(),
             shutdown,
             files,
+            endpoint_policy: args.endpoint_policy,
         },
         transfer: TransferSettings {
             authenticator: TransferAuthenticator::Tickets(authority),
@@ -223,12 +227,13 @@ async fn run_server(
     );
     let identity = certificate::generate_identity(&certificate_ips)?;
     let certificate_sha256 = certificate::format_sha256(&identity.sha256);
-    let mut tls =
-        rustls::ServerConfig::builder_with_provider(web_transport_quinn::crypto::default_provider())
-            .with_protocol_versions(&[&TLS13])?
-            .with_no_client_auth()
-            .with_single_cert(identity.certificate_chain, identity.private_key)
-            .context("failed to configure the WebTransport certificate")?;
+    let mut tls = rustls::ServerConfig::builder_with_provider(
+        web_transport_quinn::crypto::default_provider(),
+    )
+    .with_protocol_versions(&[&TLS13])?
+    .with_no_client_auth()
+    .with_single_cert(identity.certificate_chain, identity.private_key)
+    .context("failed to configure the WebTransport certificate")?;
     tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
     tracing::debug!(
         tls_version = "1.3",
@@ -264,7 +269,9 @@ async fn run_server(
     let transfer_sessions = Arc::new(Semaphore::new(max_sessions));
     let bridge_sessions = Arc::new(Semaphore::new(1));
     let file_sessions = Arc::new(Semaphore::new(FILE_WEBTRANSPORT_CONNECTIONS));
-    let pending_sessions = Arc::new(Semaphore::new(max_sessions.saturating_mul(4).saturating_add(16)));
+    let pending_sessions = Arc::new(Semaphore::new(
+        max_sessions.saturating_mul(4).saturating_add(16),
+    ));
     let per_ip_sessions = IpConnectionTracker::new(12);
     tracing::info!(
         listen = %local_addr,
@@ -347,7 +354,10 @@ async fn run_server(
     }
     endpoint.close(0_u32.into(), b"Agent shutdown");
     endpoint.wait_idle().await;
-    if let ServerMode::Launched { shutdown, files, .. } = &settings.mode {
+    if let ServerMode::Launched {
+        shutdown, files, ..
+    } = &settings.mode
+    {
         files.cancel_all();
         let _ = shutdown.send(true);
     }
@@ -443,11 +453,19 @@ async fn handle_incoming(
                 authority,
                 shutdown,
                 files,
+                endpoint_policy,
             } = &settings.mode
             else {
                 anyhow::bail!("Bridge route is unavailable");
             };
-            let result = bridge::run_session(session, authority.clone(), files.clone(), port).await;
+            let result = bridge::run_session(
+                session,
+                authority.clone(),
+                files.clone(),
+                endpoint_policy.clone(),
+                port,
+            )
+            .await;
             tracing::info!(
                 %remote,
                 connection_id,
@@ -491,20 +509,29 @@ fn request_route(
         .ok_or(RouteRejection::MissingOrigin)?
         .to_str()
         .map_err(|_| RouteRejection::InvalidOrigin)?;
-    if !settings.allowed_origins.iter().any(|allowed| allowed == origin) {
+    if !settings
+        .allowed_origins
+        .iter()
+        .any(|allowed| allowed == origin)
+    {
         return Err(RouteRejection::OriginNotAllowed);
     }
     match &settings.mode {
         ServerMode::Manual { path } if request.url.path() == path => Ok(Route::Transfer),
         ServerMode::Launched { .. } if request.url.path() == BRIDGE_PATH => Ok(Route::Bridge),
         ServerMode::Launched { .. } if request.url.path() == BENCHMARK_PATH => Ok(Route::Transfer),
-        ServerMode::Launched { .. } if request.url.path() == FILE_WEBTRANSPORT_PATH => Ok(Route::NativeFile),
+        ServerMode::Launched { .. } if request.url.path() == FILE_WEBTRANSPORT_PATH => {
+            Ok(Route::NativeFile)
+        }
         _ => Err(RouteRejection::PathNotAllowed),
     }
 }
 
 fn validate_origin_list(origins: &[String]) -> anyhow::Result<()> {
-    anyhow::ensure!(!origins.is_empty(), "at least one browser Origin is required");
+    anyhow::ensure!(
+        !origins.is_empty(),
+        "at least one browser Origin is required"
+    );
     anyhow::ensure!(
         origins.iter().all(|origin| valid_origin(origin)),
         "origins must use HTTPS; loopback HTTP is allowed only for development"
@@ -520,5 +547,6 @@ fn valid_origin(origin: &str) -> bool {
         return false;
     }
     url.scheme() == "https"
-        || (url.scheme() == "http" && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")))
+        || (url.scheme() == "http"
+            && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")))
 }

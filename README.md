@@ -78,6 +78,8 @@ cargo build -p winrisef-agent
 
 Agent 与已认证的本机 Bridge 同生命周期：关闭传输页或关闭极速模式后会释放监听端口；启动回调在约两分钟内未完成时也会自动退出，因此可以直接重复下一轮测试。
 
+检测到公网 IPv6 时，Agent 会在本机 Bridge 已可连接后异步申请 Windows 防火墙权限。UAC 等待不会阻塞极速模式启动；私有 IPv4/CGNAT/ULA 通道可先使用，公网 GUA IPv6 endpoint 仅在规则创建成功后发布。拒绝权限只关闭公网 IPv6 路径，不影响 IPv4、内网直连或 WebRTC。
+
 ### 低开销诊断日志
 
 `launch`、`serve`、协议注册和协议移除每次运行都会创建独立日志文件：

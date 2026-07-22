@@ -18,6 +18,8 @@ mod metrics;
 mod network_endpoints;
 mod protocol_registration;
 mod server;
+#[allow(unsafe_code)]
+mod single_instance;
 mod transfer;
 mod tuning;
 

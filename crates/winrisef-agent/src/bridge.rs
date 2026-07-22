@@ -7,7 +7,7 @@ use crate::{
     auth::{TicketAuthority, parse_hex},
     certificate,
     file_transfer::{FileTransferManager, NativeDataPlane},
-    network_endpoints::{self, PublishedNetworkEndpoints},
+    network_endpoints::{self, EndpointPolicy, PublishedNetworkEndpoints},
 };
 
 const BRIDGE_VERSION: u16 = 3;
@@ -110,6 +110,7 @@ pub async fn run_session(
     session: Session,
     authority: TicketAuthority,
     files: FileTransferManager,
+    endpoint_policy: EndpointPolicy,
     port: u16,
 ) -> anyhow::Result<()> {
     let (mut send, mut recv) = tokio::time::timeout(AUTH_TIMEOUT, session.accept_bi())
@@ -152,12 +153,13 @@ pub async fn run_session(
 
     let mut events = files.subscribe();
     let mut endpoint_changes = network_endpoints::watch_changes();
-    let mut endpoint_snapshot = network_endpoints::published(port);
+    let mut policy_changes = endpoint_policy.subscribe();
+    let mut endpoint_snapshot = endpoint_policy.published(port);
     loop {
         tokio::select! {
             input = read_frame(&mut recv) => {
                 let Some(input) = input? else { break };
-                let (request_id, result) = handle_input(input, &authority, &files, port).await?;
+                let (request_id, result) = handle_input(input, &authority, &files, &endpoint_policy, port).await?;
                 let output = match result {
                     Ok(result) => BridgeOutput::Response { request_id, ok: true, result: Some(result), error: None },
                     Err(error) => BridgeOutput::Response { request_id, ok: false, result: None, error: Some(error.to_string()) },
@@ -174,8 +176,18 @@ pub async fn run_session(
                 }
             }
             _ = endpoint_changes.changed() => {
-                let next = network_endpoints::published(port);
-                if next.network_epoch != endpoint_snapshot.network_epoch {
+                let next = endpoint_policy.published(port);
+                if next != endpoint_snapshot {
+                    endpoint_snapshot = next.clone();
+                    write_frame(&mut send, &BridgeOutput::NetworkEndpointsChanged { snapshot: next }).await?;
+                }
+            }
+            changed = policy_changes.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let next = endpoint_policy.published(port);
+                if next != endpoint_snapshot {
                     endpoint_snapshot = next.clone();
                     write_frame(&mut send, &BridgeOutput::NetworkEndpointsChanged { snapshot: next }).await?;
                 }
@@ -183,7 +195,8 @@ pub async fn run_session(
         }
     }
     files.cancel_all();
-    send.finish().context("failed to finish the Bridge stream")?;
+    send.finish()
+        .context("failed to finish the Bridge stream")?;
     session.close(0, b"bridge closed");
     tracing::info!("Bridge V3 session closed");
     Ok(())
@@ -193,12 +206,13 @@ async fn handle_input(
     input: BridgeInput,
     authority: &TicketAuthority,
     files: &FileTransferManager,
+    endpoint_policy: &EndpointPolicy,
     port: u16,
 ) -> anyhow::Result<(u32, anyhow::Result<Value>)> {
     let response = match input {
         BridgeInput::Hello { .. } => anyhow::bail!("Bridge hello cannot be repeated"),
         BridgeInput::IssueBenchmarkTicket { request_id } => {
-            let snapshot = network_endpoints::published(port);
+            let snapshot = endpoint_policy.published(port);
             let result = authority.issue_ticket().and_then(|ticket| {
                 serde_json::to_value(serde_json::json!({
                     "token": certificate::format_hex(&ticket.token),
@@ -212,7 +226,7 @@ async fn handle_input(
         }
         BridgeInput::GetNetworkEndpoints { request_id } => (
             request_id,
-            serde_json::to_value(network_endpoints::published(port))
+            serde_json::to_value(endpoint_policy.published(port))
                 .context("failed to encode network endpoint snapshot"),
         ),
         BridgeInput::SelectFiles { request_id } => {
@@ -237,7 +251,7 @@ async fn handle_input(
                     &peer_device_id,
                     data_plane,
                 )
-                .and_then(|grant| encode_transfer_grant(grant, port));
+                .and_then(|grant| encode_transfer_grant(grant, endpoint_policy, port));
             (request_id, result)
         }
         BridgeInput::PrepareReceiveTransfer {
@@ -259,7 +273,7 @@ async fn handle_input(
                     data_plane,
                 )
                 .await
-                .and_then(|grant| encode_transfer_grant(grant, port));
+                .and_then(|grant| encode_transfer_grant(grant, endpoint_policy, port));
             (request_id, result)
         }
         BridgeInput::CancelTransfer {
@@ -293,14 +307,18 @@ async fn handle_input(
     Ok(response)
 }
 
-fn encode_transfer_grant(grant: impl Serialize, port: u16) -> anyhow::Result<Value> {
+fn encode_transfer_grant(
+    grant: impl Serialize,
+    endpoint_policy: &EndpointPolicy,
+    port: u16,
+) -> anyhow::Result<Value> {
     let mut value = serde_json::to_value(grant).context("failed to encode transfer grant")?;
     let object = value
         .as_object_mut()
         .context("encoded transfer grant was not an object")?;
     object.insert(
         "endpointSnapshot".to_owned(),
-        serde_json::to_value(network_endpoints::published(port))
+        serde_json::to_value(endpoint_policy.published(port))
             .context("failed to encode transfer endpoint snapshot")?,
     );
     Ok(value)
@@ -319,7 +337,8 @@ async fn read_frame(recv: &mut RecvStream) -> anyhow::Result<Option<BridgeInput>
     recv.read_exact(&mut prefix[1..])
         .await
         .context("failed to read a Bridge frame length")?;
-    let len = usize::try_from(u32::from_be_bytes(prefix)).expect("u32 fits usize on supported targets");
+    let len =
+        usize::try_from(u32::from_be_bytes(prefix)).expect("u32 fits usize on supported targets");
     anyhow::ensure!(
         len > 0 && len <= MAX_FRAME_BYTES,
         "Bridge frame length is invalid"
@@ -335,7 +354,10 @@ async fn read_frame(recv: &mut RecvStream) -> anyhow::Result<Option<BridgeInput>
 
 async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec(value).context("failed to encode a Bridge frame")?;
-    anyhow::ensure!(bytes.len() <= MAX_FRAME_BYTES, "Bridge response is too large");
+    anyhow::ensure!(
+        bytes.len() <= MAX_FRAME_BYTES,
+        "Bridge response is too large"
+    );
     let len = u32::try_from(bytes.len()).context("Bridge response length does not fit u32")?;
     send.write_all(&len.to_be_bytes())
         .await

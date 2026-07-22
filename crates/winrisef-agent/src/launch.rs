@@ -11,12 +11,10 @@ use crate::{
     auth::{TicketAuthority, now_ms, random_token},
     certificate,
     cli::LaunchArgs,
-    file_http::FILE_HTTP_BASE_PATH,
-    file_webtransport::FILE_WEBTRANSPORT_PATH,
     firewall,
-    lna_http::LNA_HTTP_BASE_PATH,
-    network_endpoints::{self, NetworkEndpoints},
-    server::{self, BENCHMARK_PATH, BRIDGE_PATH, LaunchedServerSettings, ReadyInfo},
+    network_endpoints::{self, EndpointPolicy, PublicIpv6State, PublishedNetworkEndpoints},
+    server::{self, BRIDGE_PATH, LaunchedServerSettings, ReadyInfo},
+    single_instance,
 };
 
 const LAUNCH_TTL: Duration = Duration::from_secs(120);
@@ -29,6 +27,7 @@ struct Activation {
 }
 
 pub async fn run(args: LaunchArgs) -> anyhow::Result<()> {
+    let _instance_guard = single_instance::acquire()?;
     tracing::info!(
         listen = %args.listen,
         additional_trusted_origin_count = args.trusted_origins.len(),
@@ -39,11 +38,12 @@ pub async fn run(args: LaunchArgs) -> anyhow::Result<()> {
     );
     let activation = parse_activation(&args.uri, &args.trusted_origins)?;
     let network_endpoints = network_endpoints::discover();
-    if network_endpoints.has_public_ipv6()
-        && let Err(error) = firewall::ensure_inbound_rules(args.listen.port())
-    {
-        tracing::warn!(error = ?error, "public IPv6 firewall authorization was not completed; WebRTC fallback remains available");
-    }
+    let has_public_ipv6 = network_endpoints.has_public_ipv6();
+    let endpoint_policy = EndpointPolicy::new(if has_public_ipv6 {
+        PublicIpv6State::Authorizing
+    } else {
+        PublicIpv6State::NotPresent
+    });
     tracing::info!(
         allowed_origin = %activation.allowed_origin,
         return_scheme = activation.return_url.scheme(),
@@ -62,25 +62,36 @@ pub async fn run(args: LaunchArgs) -> anyhow::Result<()> {
         "created one-time launch authority"
     );
     let authority = TicketAuthority::new(launch_token, launch_expires_at_ms);
-    let callback_endpoints = network_endpoints.clone();
     let return_url = activation.return_url;
     let nonce = activation.nonce;
-    server::run_launched(
+    let firewall_policy = endpoint_policy.clone();
+    let firewall_port = args.listen.port();
+    let (firewall_start, firewall_ready) = tokio::sync::oneshot::channel();
+    let firewall_task = tokio::spawn(async move {
+        if firewall_ready.await.is_ok() {
+            maintain_public_ipv6_firewall(firewall_port, firewall_policy).await;
+        }
+    });
+    let callback_policy = endpoint_policy.clone();
+    let result = server::run_launched(
         LaunchedServerSettings {
             listen: args.listen,
             allowed_origin: activation.allowed_origin,
             certificate_ips: Vec::new(),
             authority,
+            endpoint_policy,
             max_transfer_size: args.max_transfer_size,
             max_sessions: args.max_sessions,
             metrics_enabled: args.metrics,
         },
         move |ready| {
+            let callback_endpoints = callback_policy.published(ready.port);
             tracing::info!(
                 port = ready.port,
                 certificate_sha256 = %ready.certificate_sha256,
-                callback_http_endpoint_count = callback_endpoints.http_ips.len(),
-                callback_webtransport_endpoint_count = callback_endpoints.webtransport_ips.len(),
+                callback_http_endpoint_count = callback_endpoints.lna_http_endpoints.len(),
+                callback_webtransport_endpoint_count = callback_endpoints.benchmark_endpoints.len(),
+                public_ipv6_state = ?callback_endpoints.public_ipv6_state,
                 "Agent endpoint is ready; building browser callback"
             );
             let callback = build_callback_url(
@@ -92,6 +103,7 @@ pub async fn run(args: LaunchArgs) -> anyhow::Result<()> {
                 launch_expires_at_ms,
             );
             open_browser(callback.as_str())?;
+            let _ = firewall_start.send(());
             tracing::info!(
                 callback_origin = %callback.origin().ascii_serialization(),
                 callback_path = callback.path(),
@@ -100,10 +112,68 @@ pub async fn run(args: LaunchArgs) -> anyhow::Result<()> {
             Ok(())
         },
     )
-    .await
+    .await;
+    firewall_task.abort();
+    result
 }
 
-fn parse_activation(value: &str, additional_trusted_origins: &[String]) -> anyhow::Result<Activation> {
+async fn maintain_public_ipv6_firewall(port: u16, policy: EndpointPolicy) {
+    let mut endpoint_changes = network_endpoints::watch_changes();
+    let mut authorization_result = None;
+    loop {
+        let has_public_ipv6 = network_endpoints::discover().has_public_ipv6();
+        if !has_public_ipv6 {
+            policy.set_public_ipv6_state(PublicIpv6State::NotPresent);
+        } else if let Some(authorized) = authorization_result {
+            policy.set_public_ipv6_state(if authorized {
+                PublicIpv6State::Available
+            } else {
+                PublicIpv6State::Unavailable
+            });
+        } else {
+            policy.set_public_ipv6_state(PublicIpv6State::Authorizing);
+            tracing::info!(
+                port,
+                "requesting asynchronous public IPv6 firewall authorization"
+            );
+            let started = std::time::Instant::now();
+            let result =
+                tokio::task::spawn_blocking(move || firewall::ensure_inbound_rules(port)).await;
+            let authorized = match result {
+                Ok(Ok(())) => true,
+                Ok(Err(error)) => {
+                    tracing::warn!(error = ?error, "public IPv6 firewall authorization was not completed; private endpoints and WebRTC remain available");
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(error = ?error, "public IPv6 firewall authorization task failed; private endpoints and WebRTC remain available");
+                    false
+                }
+            };
+            tracing::info!(
+                authorized,
+                elapsed_ms = started.elapsed().as_millis(),
+                "asynchronous public IPv6 firewall authorization finished"
+            );
+            authorization_result = Some(authorized);
+            if network_endpoints::discover().has_public_ipv6() {
+                policy.set_public_ipv6_state(if authorized {
+                    PublicIpv6State::Available
+                } else {
+                    PublicIpv6State::Unavailable
+                });
+            } else {
+                policy.set_public_ipv6_state(PublicIpv6State::NotPresent);
+            }
+        }
+        endpoint_changes.changed().await;
+    }
+}
+
+fn parse_activation(
+    value: &str,
+    additional_trusted_origins: &[String],
+) -> anyhow::Result<Activation> {
     tracing::trace!(
         activation_length = value.len(),
         "parsing winrisef protocol activation"
@@ -122,14 +192,21 @@ fn parse_activation(value: &str, additional_trusted_origins: &[String]) -> anyho
             _ => {}
         }
     }
-    let mut return_url = Url::parse(return_url.as_deref().context("activation is missing returnUrl")?)
-        .context("invalid browser return URL")?;
+    let mut return_url = Url::parse(
+        return_url
+            .as_deref()
+            .context("activation is missing returnUrl")?,
+    )
+    .context("invalid browser return URL")?;
     anyhow::ensure!(
         return_url.username().is_empty() && return_url.password().is_none(),
         "browser return URL must not contain credentials"
     );
     let secure = return_url.scheme() == "https";
-    let loopback = matches!(return_url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+    let loopback = matches!(
+        return_url.host_str(),
+        Some("localhost" | "127.0.0.1" | "::1")
+    );
     anyhow::ensure!(
         secure || (return_url.scheme() == "http" && loopback),
         "browser return URL is not secure"
@@ -171,7 +248,7 @@ fn build_callback_url(
     mut return_url: Url,
     nonce: &str,
     ready: &ReadyInfo,
-    endpoints: &NetworkEndpoints,
+    endpoints: &PublishedNetworkEndpoints,
     launch_token: &[u8; 16],
     launch_expires_at_ms: u64,
 ) -> Url {
@@ -183,24 +260,22 @@ fn build_callback_url(
     fragment.append_pair("certificate", &ready.certificate_sha256);
     fragment.append_pair("token", &certificate::format_hex(launch_token));
     fragment.append_pair("expires", &launch_expires_at_ms.to_string());
-    fragment.append_pair("network-epoch", &format!("{:016x}", endpoints.network_epoch));
-    for ip in &endpoints.webtransport_ips {
-        fragment.append_pair("lan", &endpoint(*ip, ready.port, BENCHMARK_PATH));
-        fragment.append_pair("file-wt", &endpoint(*ip, ready.port, FILE_WEBTRANSPORT_PATH));
+    fragment.append_pair("network-epoch", &endpoints.network_epoch);
+    fragment.append_pair("public-ipv6-state", endpoints.public_ipv6_state.as_str());
+    for endpoint in &endpoints.benchmark_endpoints {
+        fragment.append_pair("lan", endpoint);
     }
-    for ip in &endpoints.http_ips {
-        fragment.append_pair("lan-http", &http_endpoint(*ip, ready.port, LNA_HTTP_BASE_PATH));
-        fragment.append_pair("file-http", &http_endpoint(*ip, ready.port, FILE_HTTP_BASE_PATH));
+    for endpoint in &endpoints.file_web_transport_endpoints {
+        fragment.append_pair("file-wt", endpoint);
+    }
+    for endpoint in &endpoints.lna_http_endpoints {
+        fragment.append_pair("lan-http", endpoint);
+    }
+    for endpoint in &endpoints.file_http_endpoints {
+        fragment.append_pair("file-http", endpoint);
     }
     return_url.set_fragment(Some(&fragment.finish()));
     return_url
-}
-
-fn http_endpoint(ip: IpAddr, port: u16, path: &str) -> String {
-    match ip {
-        IpAddr::V4(ip) => format!("http://{ip}:{port}{path}"),
-        IpAddr::V6(ip) => format!("http://[{ip}]:{port}{path}"),
-    }
 }
 
 fn endpoint(ip: IpAddr, port: u16, path: &str) -> String {

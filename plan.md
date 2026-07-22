@@ -140,10 +140,11 @@ WebRTC 在增强模式中仍然有价值：
 
 1. 网页 A 的用户点击“启动原生增强”。
 2. 网页调用 `winrisef://launch?...` 自定义协议启动 Agent。
-3. Agent 生成短期启动凭据，并打开或回调网站 HTTPS 页面。
-4. 回调信息只放在 URL fragment，包含 loopback 端口、证书 SHA-256、一次性 launch token 和过期时间。
-5. 网页 A 使用 `serverCertificateHashes` 建立 loopback WebTransport。
-6. Agent 校验 Origin、launch token、有效期和一次性使用状态。
+3. Agent 先取得单实例互斥、绑定同端口 UDP/TCP，并生成短期启动凭据。
+4. Agent 立即打开或回调网站 HTTPS 页面；回调信息只放在 URL fragment，包含 loopback 端口、证书 SHA-256、一次性 launch token 和过期时间。
+5. 网页 A 使用 `serverCertificateHashes` 建立 loopback WebTransport，Agent 校验 Origin、launch token、有效期和一次性使用状态。
+6. 如果检测到 GUA 公网 IPv6，Agent 在 Bridge 可连接后异步检查或申请 Windows 防火墙规则；该 UAC 不阻塞本机连接。
+7. 私有 IPv4、CGNAT 和 ULA endpoint 可立即发布；GUA IPv6 只在防火墙状态为 `available` 后通过 Bridge V3 endpoint snapshot 发布。拒绝或失败只关闭公网 IPv6 路径，不关闭 Agent、LNA HTTP 或 WebRTC。
 
 不使用固定的“跳过 TLS 校验”，也不要求用户手动信任自签名证书。
 
@@ -562,6 +563,8 @@ winrisef-agent adapters → application → winrisef-core
 2026-07-19 正式文件接入已完成代码实现：协议升级到 LAN V11 与 Bridge V2，新增 opaque source registry、系统文件选择/保存、全局单 active transfer、`.part`/sync/同文件系统原子完成，以及独立于 benchmark 的 Native File V1。正式 LNA 路径使用六 XHR、最大 30MiB segment 和 4MiB 池化 positional I/O；正式 WebTransport 回退使用六 connection、每 connection 四 lane、64MiB extent 和最多 24 个 4MiB buffer。网页通过独立 local-agent/peer-bulk ports 把 native 编排注入现有聊天 Runtime；用户开启极速模式且 Agent 连接成功后，`>=64MiB` 普通文件默认自动尝试极速，不再要求额外部署特性开关，图片、语音和小文件仍走 WebRTC。LNA 拒绝、unsupported 和 endpoint failure 保持不同语义。代码阶段只执行静态/编译验证；Codex 不启动 Agent、网页、浏览器、测试用例或吞吐测速，双向 64MiB/1GiB/10GiB 与 SHA-256 由用户手工验收。
 
 2026-07-20 完成 V10/V11 新增链路清理：删除未消费的 `transfer-started`、事件冗余总量、grant 回显的固定/可推导字段、网页端重复队列状态和无引用 fixture 包装；合并 Bridge 关闭、LNA endpoint 选择、十六进制解析与 positional I/O。鉴权、单 active transfer、精确 coverage、取消清理、`.part`、sync 和原子完成保持不变。Rust Clippy、workspace tests、网页 TypeScript 和跨仓库 fixture 检查通过；未启动 Agent、网页或真实传输。
+
+2026-07-22 修复公网 IPv6 热点下的启动竞态：Windows Agent 不再在启动 Bridge 前同步等待 PowerShell/UAC，而是在 UDP/TCP 已绑定、HTTPS callback 已打开后异步授权防火墙；Bridge V3 snapshot 新增 `publicIpv6State`，私有 IPv4/CGNAT/ULA 立即可用，GUA 只在授权成功后发布。protocol launch 增加 per-user 单实例 mutex；网页启动改为 single-flight，保留未过期 nonce、接受迟到的合法 callback，并在 launching/connecting 阶段禁用重复开关。防火墙日志分别记录规则查询和 elevation 耗时。
 
 ## 16. 参考依据
 
