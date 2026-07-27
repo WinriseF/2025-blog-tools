@@ -23,6 +23,7 @@ mime_guess = "2.0.5"
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
 rfd = { version = "0.17.2", default-features = false }
+raw-window-handle = "0.6.2"
 rustls = { version = "0.23.42", default-features = false, features = ["std", "ring"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -44,6 +45,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 winrisef-platform = { path = "crates/winrisef-platform" }
 

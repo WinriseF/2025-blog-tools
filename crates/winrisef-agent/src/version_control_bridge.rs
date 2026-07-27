@@ -222,9 +222,8 @@ impl VersionControlManager {
     }
 
     fn select_repository(&self) -> anyhow::Result<Value> {
-        let selected = rfd::FileDialog::new()
-            .set_title("选择 Git 项目")
-            .pick_folder();
+        let selected =
+            crate::native_dialog::pick_folder(rfd::FileDialog::new().set_title("选择 Git 项目"));
         let Some(selected) = selected else {
             return Ok(serde_json::json!({ "cancelled": true }));
         };
@@ -407,11 +406,12 @@ impl VersionControlManager {
             "selection contains an unsupported file"
         );
         let extension = options.format.extension();
-        let path = rfd::FileDialog::new()
-            .set_title("导出 Git 对比")
-            .set_file_name(format!("git-diff.{extension}"))
-            .add_filter(extension.to_uppercase(), &[extension])
-            .save_file();
+        let path = crate::native_dialog::save_file(
+            rfd::FileDialog::new()
+                .set_title("导出 Git 对比")
+                .set_file_name(format!("git-diff.{extension}"))
+                .add_filter(extension.to_uppercase(), &[extension]),
+        );
         let Some(path) = path else {
             return Ok(serde_json::json!({ "cancelled": true }));
         };

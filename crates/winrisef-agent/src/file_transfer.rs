@@ -222,7 +222,8 @@ impl FileTransferManager {
 
     pub async fn select_files(&self) -> anyhow::Result<Vec<SelectedFileMetadata>> {
         let selected = tokio::task::spawn_blocking(|| {
-            let paths = rfd::FileDialog::new().pick_files().unwrap_or_default();
+            let paths =
+                crate::native_dialog::pick_files(rfd::FileDialog::new()).unwrap_or_default();
             paths
                 .into_iter()
                 .map(open_selected_source)
@@ -291,7 +292,7 @@ impl FileTransferManager {
         anyhow::ensure!(total_bytes > 0, "file size must be positive");
         let suggested_name = name.to_owned();
         let destination = tokio::task::spawn_blocking(move || {
-            rfd::FileDialog::new().set_file_name(&suggested_name).save_file()
+            crate::native_dialog::save_file(rfd::FileDialog::new().set_file_name(&suggested_name))
         })
         .await
         .context("save file dialog task panicked")?;
@@ -379,9 +380,11 @@ impl FileTransferManager {
             "lane index is invalid"
         );
         let extent_index = offset / FILE_WEBTRANSPORT_EXTENT_BYTES;
-        let expected_lane = connection.connection_index * FILE_WEBTRANSPORT_LANES_PER_CONNECTION + lane_index;
+        let expected_lane =
+            connection.connection_index * FILE_WEBTRANSPORT_LANES_PER_CONNECTION + lane_index;
         anyhow::ensure!(
-            extent_index % (FILE_WEBTRANSPORT_CONNECTIONS * FILE_WEBTRANSPORT_LANES_PER_CONNECTION) as u64
+            extent_index
+                % (FILE_WEBTRANSPORT_CONNECTIONS * FILE_WEBTRANSPORT_LANES_PER_CONNECTION) as u64
                 == expected_lane as u64,
             "extent was assigned to the wrong WebTransport lane"
         );
@@ -411,7 +414,10 @@ impl FileTransferManager {
                 .transfer
                 .last_progress_bytes
                 .store(completed, Ordering::Relaxed);
-            lease.transfer.last_progress_ms.store(now, Ordering::Relaxed);
+            lease
+                .transfer
+                .last_progress_ms
+                .store(now, Ordering::Relaxed);
             self.publish(NativeTransferEvent::Progress {
                 transfer_id: lease.transfer.transfer_id.clone(),
                 attachment_id: lease.transfer.attachment_id.clone(),
@@ -441,7 +447,10 @@ impl FileTransferManager {
     }
 
     fn complete_receive_transfer(&self, transfer: Arc<ActiveTransfer>) -> anyhow::Result<()> {
-        anyhow::ensure!(transfer.segments.is_complete(), "file coverage is incomplete");
+        anyhow::ensure!(
+            transfer.segments.is_complete(),
+            "file coverage is incomplete"
+        );
         let TransferResource::Receive {
             file,
             part_path,
@@ -455,7 +464,8 @@ impl FileTransferManager {
             attachment_id: transfer.attachment_id.clone(),
             bytes: transfer.total_bytes,
         });
-        file.sync_all().context("failed to flush the received file")?;
+        file.sync_all()
+            .context("failed to flush the received file")?;
         winrisef_platform::atomic_replace(part_path, final_path)
             .context("failed to atomically finish the received file")?;
         self.take_active(&transfer.transfer_id)?;
@@ -515,7 +525,12 @@ impl FileTransferManager {
     }
 
     pub fn cancel_all(&self) {
-        let transfer = self.inner.active.lock().ok().and_then(|mut active| active.take());
+        let transfer = self
+            .inner
+            .active
+            .lock()
+            .ok()
+            .and_then(|mut active| active.take());
         if let Some(transfer) = transfer {
             transfer.cancelled.store(true, Ordering::Release);
             cleanup_resource(&transfer.resource);
@@ -640,7 +655,9 @@ impl FileTransferManager {
             .active
             .lock()
             .map_err(|_| anyhow::anyhow!("active transfer registry is unavailable"))?;
-        let transfer = active.as_ref().context("native file transfer is not active")?;
+        let transfer = active
+            .as_ref()
+            .context("native file transfer is not active")?;
         anyhow::ensure!(
             transfer.transfer_id == transfer_id,
             "transfer identifier does not match"
@@ -659,10 +676,21 @@ impl ActiveTransfer {
             self.data_plane == NativeDataPlane::LnaHttp,
             "transfer does not use LNA HTTP"
         );
-        anyhow::ensure!(self.direction == direction, "transfer direction does not match");
-        anyhow::ensure!(!self.cancelled.load(Ordering::Acquire), "transfer was cancelled");
-        let expected = self.lna_token.context("LNA transfer token is unavailable")?;
-        anyhow::ensure!(constant_time_equal(&expected, token), "transfer token is invalid");
+        anyhow::ensure!(
+            self.direction == direction,
+            "transfer direction does not match"
+        );
+        anyhow::ensure!(
+            !self.cancelled.load(Ordering::Acquire),
+            "transfer was cancelled"
+        );
+        let expected = self
+            .lna_token
+            .context("LNA transfer token is unavailable")?;
+        anyhow::ensure!(
+            constant_time_equal(&expected, token),
+            "transfer token is invalid"
+        );
         self.validate_time()
     }
 
@@ -677,12 +705,18 @@ impl ActiveTransfer {
             self.data_plane == NativeDataPlane::WebTransport,
             "transfer does not use WebTransport"
         );
-        anyhow::ensure!(self.direction == direction, "transfer direction does not match");
+        anyhow::ensure!(
+            self.direction == direction,
+            "transfer direction does not match"
+        );
         anyhow::ensure!(
             self.peer_device_id == peer_device_id,
             "transfer peer does not match"
         );
-        anyhow::ensure!(!self.cancelled.load(Ordering::Acquire), "transfer was cancelled");
+        anyhow::ensure!(
+            !self.cancelled.load(Ordering::Acquire),
+            "transfer was cancelled"
+        );
         let expected = self
             .webtransport_tokens
             .get(connection_index)
@@ -699,14 +733,20 @@ impl ActiveTransfer {
         let state = consumed
             .get_mut(connection_index)
             .context("WebTransport connection index is invalid")?;
-        anyhow::ensure!(!*state, "WebTransport connection token was already consumed");
+        anyhow::ensure!(
+            !*state,
+            "WebTransport connection token was already consumed"
+        );
         *state = true;
         Ok(())
     }
 
     fn validate_time(&self) -> anyhow::Result<()> {
         let now = now_ms()?;
-        anyhow::ensure!(now <= self.hard_expires_at, "transfer authorization expired");
+        anyhow::ensure!(
+            now <= self.hard_expires_at,
+            "transfer authorization expired"
+        );
         let idle = now.saturating_sub(self.last_activity_ms.load(Ordering::Acquire));
         anyhow::ensure!(
             idle <= TRANSFER_IDLE_TTL.as_millis() as u64,
@@ -742,10 +782,14 @@ impl SegmentTracker {
             offset.is_multiple_of(self.segment_bytes),
             "segment offset is not aligned"
         );
-        anyhow::ensure!(offset < self.total_bytes, "segment offset is outside the file");
+        anyhow::ensure!(
+            offset < self.total_bytes,
+            "segment offset is outside the file"
+        );
         let expected = self.segment_bytes.min(self.total_bytes - offset);
         anyhow::ensure!(len == expected, "segment length is invalid");
-        let index = usize::try_from(offset / self.segment_bytes).context("segment index is too large")?;
+        let index =
+            usize::try_from(offset / self.segment_bytes).context("segment index is too large")?;
         let mut states = self
             .states
             .lock()
@@ -753,7 +797,10 @@ impl SegmentTracker {
         let state = states
             .get_mut(index)
             .context("segment index is outside the file")?;
-        anyhow::ensure!(*state == SegmentState::Pending, "segment was already requested");
+        anyhow::ensure!(
+            *state == SegmentState::Pending,
+            "segment was already requested"
+        );
         *state = SegmentState::Active;
         Ok(index)
     }
@@ -799,7 +846,8 @@ impl SegmentLease {
             anyhow::bail!("transfer source is not readable");
         };
         while !buffer.is_empty() {
-            let read = positional_read(file, buffer, offset).context("failed to read the selected file")?;
+            let read = positional_read(file, buffer, offset)
+                .context("failed to read the selected file")?;
             anyhow::ensure!(read > 0, "selected file ended during transfer");
             offset += read as u64;
             buffer = &mut buffer[read..];
@@ -812,8 +860,8 @@ impl SegmentLease {
             anyhow::bail!("transfer destination is not writable");
         };
         while !buffer.is_empty() {
-            let written =
-                positional_write(file, buffer, offset).context("failed to write the destination file")?;
+            let written = positional_write(file, buffer, offset)
+                .context("failed to write the destination file")?;
             anyhow::ensure!(written > 0, "destination file accepted an empty write");
             offset += written as u64;
             buffer = &buffer[written..];
@@ -854,7 +902,9 @@ impl Drop for SegmentLease {
 
 fn open_selected_source(path: PathBuf) -> anyhow::Result<SelectedSource> {
     let file = File::open(&path).context("failed to open a selected file")?;
-    let metadata = file.metadata().context("failed to read selected file metadata")?;
+    let metadata = file
+        .metadata()
+        .context("failed to read selected file metadata")?;
     anyhow::ensure!(
         metadata.is_file() && metadata.len() > 0,
         "selected item is not a non-empty file"
@@ -868,7 +918,9 @@ fn open_selected_source(path: PathBuf) -> anyhow::Result<SelectedSource> {
         .modified()
         .ok()
         .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |duration| duration.as_millis().try_into().unwrap_or(u64::MAX));
+        .map_or(0, |duration| {
+            duration.as_millis().try_into().unwrap_or(u64::MAX)
+        });
     Ok(SelectedSource {
         metadata: SelectedFileMetadata {
             source_id: random_hex::<16>()?,
@@ -903,8 +955,9 @@ fn cleanup_resource(resource: &TransferResource) {
 
 fn random_bytes<const N: usize>() -> anyhow::Result<[u8; N]> {
     let mut bytes = [0_u8; N];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| anyhow::anyhow!("failed to create secure transfer credentials: {error}"))?;
+    getrandom::fill(&mut bytes).map_err(|error| {
+        anyhow::anyhow!("failed to create secure transfer credentials: {error}")
+    })?;
     Ok(bytes)
 }
 
@@ -955,14 +1008,25 @@ mod tests {
 
     #[test]
     fn native_file_fixture_matches_rust_constants() {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../../../protocol-fixtures/native-file-v1.json")).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../protocol-fixtures/native-file-v1.json"
+        ))
+        .unwrap();
         assert_eq!(fixture["lanSessionVersion"], 12);
         assert_eq!(fixture["bridgeVersion"], 3);
         assert_eq!(fixture["fileVersion"], super::NATIVE_FILE_VERSION);
-        assert_eq!(fixture["lnaHttp"]["segmentBytes"], super::FILE_HTTP_SEGMENT_BYTES);
-        assert_eq!(fixture["lnaHttp"]["parallelism"], super::FILE_HTTP_PARALLELISM);
-        assert_eq!(fixture["lnaHttp"]["ioBlockBytes"], super::FILE_IO_BLOCK_BYTES);
+        assert_eq!(
+            fixture["lnaHttp"]["segmentBytes"],
+            super::FILE_HTTP_SEGMENT_BYTES
+        );
+        assert_eq!(
+            fixture["lnaHttp"]["parallelism"],
+            super::FILE_HTTP_PARALLELISM
+        );
+        assert_eq!(
+            fixture["lnaHttp"]["ioBlockBytes"],
+            super::FILE_IO_BLOCK_BYTES
+        );
         assert_eq!(
             fixture["webTransport"]["connections"],
             super::FILE_WEBTRANSPORT_CONNECTIONS

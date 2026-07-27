@@ -15,6 +15,8 @@ mod launch;
 mod lna_http;
 mod metrics;
 #[allow(unsafe_code)]
+mod native_dialog;
+#[allow(unsafe_code)]
 mod network_endpoints;
 mod protocol_registration;
 mod server;
