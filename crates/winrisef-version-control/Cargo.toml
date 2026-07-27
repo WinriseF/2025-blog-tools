@@ -1,0 +1,15 @@
+[package]
+name = "winrisef-version-control"
+description = "Read-only Git inspection and export engine for WinriseF Toolbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+git2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+

@@ -7,8 +7,8 @@ mod bridge;
 mod certificate;
 mod cli;
 mod diagnostics;
-mod file_transfer;
 mod file_http;
+mod file_transfer;
 mod file_webtransport;
 mod firewall;
 mod launch;
@@ -22,6 +22,8 @@ mod server;
 mod single_instance;
 mod transfer;
 mod tuning;
+mod version_control_bridge;
+mod version_control_server;
 
 use clap::Parser;
 use cli::{Cli, Command};

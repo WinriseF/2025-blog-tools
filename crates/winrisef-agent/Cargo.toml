@@ -30,3 +30,4 @@ web-transport-quinn.workspace = true
 windows-sys.workspace = true
 winrisef-platform.workspace = true
 winrisef-core = { path = "../winrisef-core" }
+winrisef-version-control = { path = "../winrisef-version-control" }

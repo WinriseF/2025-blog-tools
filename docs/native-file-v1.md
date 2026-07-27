@@ -6,8 +6,8 @@
 
 | 项目 | 值 |
 | --- | ---: |
-| LAN Session | 11 |
-| Local Bridge | 2 |
+| LAN Session | 12 |
+| Local Bridge | 3 |
 | Native File | 1 |
 | Bridge/control 最大 JSON | 64KiB |
 | LNA HTTP worker | 6 |
@@ -31,14 +31,14 @@ Rust 与 TypeScript 必须共同通过 `protocol-fixtures/native-file-v1.json` �
 - token 不进入 URL、日志、Supabase 或附件历史；日志不得包含绝对路径和文件内容。
 - 首版失败或取消删除 `.part`，不做断点续传、逐块哈希或多文件并行。
 
-## 3. Local Bridge V2
+## 3. Local Bridge V3
 
-Bridge 路径为 `/winrisef/bridge/v2`。每帧是 `4-byte big-endian JSON length + UTF-8 JSON`，长度必须在 `1..=65536`。
+Bridge 路径为 `/winrisef/bridge/v3`。每帧是 `4-byte big-endian JSON length + UTF-8 JSON`，长度必须在 `1..=65536`。
 
 首帧必须是：
 
 ```json
-{"type":"hello","version":2,"launchToken":"<128-bit hex>"}
+{"type":"hello","version":3,"launchToken":"<128-bit hex>"}
 ```
 
 响应为 `hello-ack`。认证后，命令使用递增 `requestId`；响应统一为：
@@ -59,7 +59,7 @@ Bridge 路径为 `/winrisef/bridge/v2`。每帧是 `4-byte big-endian JSON lengt
 
 文件元数据只包含 opaque source ID、文件名、大小和 MIME。Bridge 可推送 `transfer-progress`、`transfer-confirming`、`transfer-complete`、`transfer-failed`、`transfer-cancelled`；进度最多每 250ms 或每 32MiB 推送一次。
 
-## 4. WebRTC V11 控制消息
+## 4. WebRTC V12 控制消息
 
 `LanBulkDataPlane` 固定为 `webrtc`、`native-lna-http`、`native-webtransport`。`LanAttachment` 和 `attachment-offer` 携带 `dataPlane`；native offer 还携带 source 所在位置和 Agent owner device ID。
 

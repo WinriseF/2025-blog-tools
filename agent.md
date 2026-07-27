@@ -523,7 +523,17 @@ unbounded channel
 
 当前实现保留 Chrome 142+ LNA HTTP/TCP 与六连接 WebTransport memory benchmark，并已增加正式 Native File V1：Bridge V3 系统选取/保存、动态 endpoint snapshot、opaque source、全局单任务、`.part`/sync/原子完成、六 XHR/30MiB LNA 数据面，以及六 connection × 四 lane/64MiB extent 的 WebTransport 回退。Windows protocol launch 使用单实例互斥；本机 Bridge 先启动，公网 IPv6 防火墙授权随后异步完成，GUA endpoint 只在授权成功后发布。网页的 WebRTC V12 仍是唯一控制面；只有 `>=64MiB` 普通文件进入 native，图片、语音、小文件继续 WebRTC。LNA `denied` 不阻止已授权的公网 IPv6 WebTransport；其他路径失败保持 WebRTC 回退。当前仅做静态/编译验证，未由 Codex 启动 Agent、网页、浏览器或实际传输。
 
-## 18. Definition of Done
+## 18. Version Control 本机只读上下文
+
+Agent 支持 `winrisef://launch?...&feature=version-control`。该模式与 transfer 共用单实例互斥，但只绑定 `127.0.0.1` WebTransport 与 `/winrisef/version-control/v1`，不初始化 LAN HTTP、文件传输、地址发现或防火墙授权。重复启动通过回调返回稳定的 `agent_busy`。
+
+`crates/winrisef-version-control` 是独立 Git 读取内核，使用仅启用本地能力的 vendored `git2/libgit2`，不启用 SSH/HTTPS/OpenSSL，也不依赖 `git.exe`。网页只能以 Agent 生成的 repository/diff/file/export ID 调用；目录和保存目标只由 `rfd` 系统对话框产生。控制帧维持 64KiB 并按序列化预算分页，源码预览走独立单向流，Git 阻塞读取在 blocking worker 中执行。`open-diff` 不得预生成或缓存所有文件的 patch 正文；历史提交比较不得逐文件读取当前 worktree status。浏览会话只保留一份有界元数据和内容定位，GitPatch 在导出开始后重建一次原生 Diff、建立路径索引并逐文件生成；命中原生 patch 时不得额外读取两侧完整正文。
+
+只读范围包含历史、HEAD/本地与已有远程引用、标签、stash、HEAD reflog 删除分支提示、工作区与冲突 stage。禁止 checkout/switch、fetch/pull/push、stage、commit、restore/reset 和 stash 写操作。导出是唯一写入例外：系统保存框、仓库内二次确认、同目录临时文件、sync 与原子完成，失败、取消或 Bridge 会话退出时清理临时文件。
+
+Git V1 支持普通仓库、linked worktree、bare 和 gitlink；预览每侧 2MiB，导出每侧 32MiB。日志不得记录源码、diff、token 或绝对路径。SVN 延后到独立阶段，当前不创建空抽象或依赖。
+
+## 19. Definition of Done
 
 一项功能只有同时满足以下条件才算完成：
 

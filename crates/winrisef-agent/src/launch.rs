@@ -14,7 +14,7 @@ use crate::{
     firewall,
     network_endpoints::{self, EndpointPolicy, PublicIpv6State, PublishedNetworkEndpoints},
     server::{self, BRIDGE_PATH, LaunchedServerSettings, ReadyInfo},
-    single_instance,
+    single_instance, version_control_server,
 };
 
 const LAUNCH_TTL: Duration = Duration::from_secs(120);
@@ -24,10 +24,31 @@ struct Activation {
     return_url: Url,
     nonce: String,
     allowed_origin: String,
+    feature: LaunchFeature,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchFeature {
+    Transfer,
+    VersionControl,
 }
 
 pub async fn run(args: LaunchArgs) -> anyhow::Result<()> {
-    let _instance_guard = single_instance::acquire()?;
+    let activation = parse_activation(&args.uri, &args.trusted_origins)?;
+    let _instance_guard = match single_instance::acquire() {
+        Ok(guard) => guard,
+        Err(_error) if activation.feature == LaunchFeature::VersionControl => {
+            let callback = build_version_control_error_callback(
+                activation.return_url,
+                &activation.nonce,
+                "agent_busy",
+            );
+            open_browser(callback.as_str())?;
+            tracing::info!("reported version-control Agent busy state to the browser");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     tracing::info!(
         listen = %args.listen,
         additional_trusted_origin_count = args.trusted_origins.len(),
@@ -36,7 +57,9 @@ pub async fn run(args: LaunchArgs) -> anyhow::Result<()> {
         metrics_enabled = args.metrics,
         "processing browser protocol activation"
     );
-    let activation = parse_activation(&args.uri, &args.trusted_origins)?;
+    if activation.feature == LaunchFeature::VersionControl {
+        return run_version_control(activation).await;
+    }
     let network_endpoints = network_endpoints::discover();
     let has_public_ipv6 = network_endpoints.has_public_ipv6();
     let endpoint_policy = EndpointPolicy::new(if has_public_ipv6 {
@@ -117,6 +140,21 @@ pub async fn run(args: LaunchArgs) -> anyhow::Result<()> {
     result
 }
 
+async fn run_version_control(activation: Activation) -> anyhow::Result<()> {
+    let launch_token = random_token()?;
+    let expires_at_ms = now_ms()?.saturating_add(LAUNCH_TTL.as_millis() as u64);
+    let authority = TicketAuthority::new(launch_token, expires_at_ms);
+    let return_url = activation.return_url;
+    let nonce = activation.nonce;
+    version_control_server::run(activation.allowed_origin, authority, move |ready| {
+        let callback =
+            build_version_control_callback(return_url, &nonce, ready, &launch_token, expires_at_ms);
+        open_browser(callback.as_str())?;
+        Ok(())
+    })
+    .await
+}
+
 async fn maintain_public_ipv6_firewall(port: u16, policy: EndpointPolicy) {
     let mut endpoint_changes = network_endpoints::watch_changes();
     let mut authorization_result = None;
@@ -185,10 +223,18 @@ fn parse_activation(
     );
     let mut return_url = None;
     let mut nonce = None;
+    let mut feature = LaunchFeature::Transfer;
     for (key, value) in activation.query_pairs() {
         match key.as_ref() {
             "returnUrl" => return_url = Some(value.into_owned()),
             "nonce" => nonce = Some(value.into_owned()),
+            "feature" => {
+                feature = match value.as_ref() {
+                    "transfer" => LaunchFeature::Transfer,
+                    "version-control" => LaunchFeature::VersionControl,
+                    _ => anyhow::bail!("unsupported Agent feature"),
+                }
+            }
             _ => {}
         }
     }
@@ -241,7 +287,40 @@ fn parse_activation(
         return_url,
         nonce,
         allowed_origin,
+        feature,
     })
+}
+
+fn build_version_control_callback(
+    mut return_url: Url,
+    nonce: &str,
+    ready: &ReadyInfo,
+    launch_token: &[u8; 16],
+    expires_at_ms: u64,
+) -> Url {
+    let bridge = endpoint(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ready.port,
+        version_control_server::VERSION_CONTROL_PATH,
+    );
+    let mut fragment = url::form_urlencoded::Serializer::new(String::new());
+    fragment.append_pair("winrisef-version-control", "1");
+    fragment.append_pair("nonce", nonce);
+    fragment.append_pair("bridge", &bridge);
+    fragment.append_pair("certificate", &ready.certificate_sha256);
+    fragment.append_pair("token", &certificate::format_hex(launch_token));
+    fragment.append_pair("expires", &expires_at_ms.to_string());
+    return_url.set_fragment(Some(&fragment.finish()));
+    return_url
+}
+
+fn build_version_control_error_callback(mut return_url: Url, nonce: &str, error: &str) -> Url {
+    let mut fragment = url::form_urlencoded::Serializer::new(String::new());
+    fragment.append_pair("winrisef-version-control", "1");
+    fragment.append_pair("nonce", nonce);
+    fragment.append_pair("error", error);
+    return_url.set_fragment(Some(&fragment.finish()));
+    return_url
 }
 
 fn build_callback_url(

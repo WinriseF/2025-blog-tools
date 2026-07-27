@@ -20,4 +20,4 @@ Agent 是 Toolbox 与电脑之间的便携本机能力接口。当前提供局�
 - Windows fixed file/product version：`0.1.0.1`
 - Windows display version：`0.1.0 Beta 1`
 
-发布版本与通信协议版本独立维护：LAN Session 为 V11、Local Bridge 为 V2、Native File 为 V1、测速协议为 V3。协议不兼容时只提升相应协议 major，不以 EXE 的显示版本推断兼容性。
+发布版本与通信协议版本独立维护：LAN Session 为 V12、Local Bridge 为 V3、Native File 为 V1、测速协议为 V3。协议不兼容时只提升相应协议 major，不以 EXE 的显示版本推断兼容性。

@@ -10,6 +10,9 @@ fn main() {
     println!("cargo:rerun-if-changed={}", resource.display());
     println!(
         "cargo:rustc-link-arg-bin=winrisef-agent={}",
-        resource.canonicalize().expect("Windows resource must exist").display()
+        resource
+            .canonicalize()
+            .expect("Windows resource must exist")
+            .display()
     );
 }
