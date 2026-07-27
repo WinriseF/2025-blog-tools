@@ -14,20 +14,22 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
-use web_transport_quinn::{RecvStream, SendStream, Session};
+use web_transport_quinn::Session;
 use winrisef_version_control::{
     ConflictPerspective, DiffSession, ExportFormat, ExportLayout, ExportOptions, RepositoryReader,
     RevisionRef, WorkingTreeGroup,
 };
 
 use crate::auth::{TicketAuthority, parse_hex};
+use crate::svn_repository::{SvnDiffSession, SvnRepository};
+use crate::version_control_io::{read_frame, write_frame, write_preview_stream};
+use crate::version_control_helpers::{backend_overview, candidate_json, diff_files_json, diff_len, diff_summary};
 
 mod file_selection;
 
 use file_selection::FileSelection;
 
-const VERSION: u16 = 1;
-const MAX_FRAME_BYTES: usize = 64 * 1024;
+const VERSION: u16 = 2;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HISTORY_PAGE: usize = 64;
 const MAX_FILE_PAGE: usize = 128;
@@ -35,7 +37,7 @@ const MAX_DIFF_SESSIONS: usize = 3;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-enum BridgeInput {
+pub(crate) enum BridgeInput {
     Hello {
         version: u16,
         #[serde(rename = "launchToken")]
@@ -44,6 +46,18 @@ enum BridgeInput {
     SelectRepository {
         #[serde(rename = "requestId")]
         request_id: u32,
+    },
+    OpenRepositoryCandidate {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "candidateId")]
+        candidate_id: String,
+    },
+    ConnectHistory {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "repositoryId")]
+        repository_id: String,
     },
     CloseRepository {
         #[serde(rename = "requestId")]
@@ -177,9 +191,19 @@ pub enum ExportEvent {
 
 struct RepositoryState {
     id: String,
-    reader: RepositoryReader,
-    diffs: HashMap<String, Arc<DiffSession>>,
+    backend: RepositoryBackend,
+    diffs: HashMap<String, DiffState>,
     diff_order: VecDeque<String>,
+}
+
+pub(crate) enum RepositoryBackend {
+    Git(RepositoryReader),
+    Svn(SvnRepository),
+}
+
+pub(crate) enum DiffState {
+    Git(Arc<DiffSession>),
+    Svn(Arc<SvnDiffSession>),
 }
 
 struct PendingExport {
@@ -199,6 +223,7 @@ struct ActiveExport {
 #[derive(Default)]
 struct ManagerState {
     repository: Option<RepositoryState>,
+    candidates: HashMap<String, RepositoryBackend>,
     pending_exports: HashMap<String, PendingExport>,
     active_export: Option<ActiveExport>,
 }
@@ -222,19 +247,55 @@ impl VersionControlManager {
     }
 
     fn select_repository(&self) -> anyhow::Result<Value> {
-        let selected =
-            crate::native_dialog::pick_folder(rfd::FileDialog::new().set_title("选择 Git 项目"));
+        let selected = crate::native_dialog::pick_folder(
+            rfd::FileDialog::new().set_title("选择 Git 或 SVN 项目"),
+        );
         let Some(selected) = selected else {
             return Ok(serde_json::json!({ "cancelled": true }));
         };
-        let reader = RepositoryReader::discover(&selected)?;
-        let overview = reader.overview()?;
-        let id = random_id()?;
+        let mut detected = Vec::new();
+        if let Ok(reader) = RepositoryReader::discover(&selected) {
+            detected.push(RepositoryBackend::Git(reader));
+        }
+        if let Some(repository) = SvnRepository::discover(&selected)? {
+            detected.push(RepositoryBackend::Svn(repository));
+        }
+        anyhow::ensure!(!detected.is_empty(), "所选目录不是 Git 或 SVN 工作副本");
         let mut state = self.lock()?;
-        cancel_active_export(&mut state);
+        state.candidates.clear();
+        if detected.len() > 1 {
+            let mut candidates = Vec::new();
+            for backend in detected {
+                let candidate_id = random_id()?;
+                candidates.push(candidate_json(&candidate_id, &backend));
+                state.candidates.insert(candidate_id, backend);
+            }
+            return Ok(serde_json::json!({ "cancelled": false, "candidates": candidates }));
+        }
+        self.open_backend_locked(&mut state, detected.into_iter().next().expect("candidate"))
+    }
+
+    fn open_repository_candidate(&self, candidate_id: &str) -> anyhow::Result<Value> {
+        let mut state = self.lock()?;
+        let backend = state
+            .candidates
+            .remove(candidate_id)
+            .context("repository candidate is no longer available")?;
+        self.open_backend_locked(&mut state, backend)
+    }
+
+    fn open_backend_locked(
+        &self,
+        state: &mut ManagerState,
+        backend: RepositoryBackend,
+    ) -> anyhow::Result<Value> {
+        let overview = backend_overview(&backend)?;
+        let id = random_id()?;
+        cancel_active_export(state);
+        state.candidates.clear();
         state.repository = Some(RepositoryState {
             id: id.clone(),
-            reader,
+            backend,
             diffs: HashMap::new(),
             diff_order: VecDeque::new(),
         });
@@ -247,6 +308,7 @@ impl VersionControlManager {
         self.ensure_repository(&state, repository_id)?;
         cancel_active_export(&mut state);
         state.repository = None;
+        state.candidates.clear();
         state.pending_exports.clear();
         Ok(serde_json::json!({ "closed": true }))
     }
@@ -254,7 +316,16 @@ impl VersionControlManager {
     fn overview(&self, repository_id: &str) -> anyhow::Result<Value> {
         let state = self.lock()?;
         let repository = self.ensure_repository(&state, repository_id)?;
-        Ok(serde_json::to_value(repository.reader.overview()?)?)
+        backend_overview(&repository.backend)
+    }
+
+    fn connect_history(&self, repository_id: &str) -> anyhow::Result<Value> {
+        let mut state = self.lock()?;
+        let repository = self.ensure_repository_mut(&mut state, repository_id)?;
+        match &mut repository.backend {
+            RepositoryBackend::Git(_) => Ok(serde_json::json!({ "connected": true })),
+            RepositoryBackend::Svn(repository) => repository.connect_history(),
+        }
     }
 
     fn history(
@@ -267,7 +338,13 @@ impl VersionControlManager {
         let state = self.lock()?;
         let repository = self.ensure_repository(&state, repository_id)?;
         let limit = limit.clamp(1, MAX_HISTORY_PAGE);
-        let mut commits = repository.reader.history(query, skip, limit + 1)?;
+        if let RepositoryBackend::Svn(repository) = &repository.backend {
+            return repository.history(query, skip, limit);
+        }
+        let mut commits = match &repository.backend {
+            RepositoryBackend::Git(reader) => reader.history(query, skip, limit + 1)?,
+            RepositoryBackend::Svn(_) => unreachable!(),
+        };
         let has_more = commits.len() > limit;
         commits.truncate(limit);
         let mut has_more = has_more;
@@ -296,10 +373,12 @@ impl VersionControlManager {
     ) -> anyhow::Result<Value> {
         let mut state = self.lock()?;
         let repository = self.ensure_repository_mut(&mut state, repository_id)?;
-        let diff = Arc::new(repository.reader.create_diff(old, new, group)?);
+        let diff = match &repository.backend {
+            RepositoryBackend::Git(reader) => DiffState::Git(Arc::new(reader.create_diff(old, new, group)?)),
+            RepositoryBackend::Svn(svn) => DiffState::Svn(Arc::new(svn.open_diff(&serde_json::to_value(&old)?, &serde_json::to_value(&new)?, group)?)),
+        };
         let id = random_id()?;
-        let summary = diff.summary.clone();
-        let total_files = diff.len();
+        let (summary, total_files) = diff_summary(&diff);
         repository.diffs.insert(id.clone(), diff);
         repository.diff_order.push_back(id.clone());
         while repository.diff_order.len() > MAX_DIFF_SESSIONS {
@@ -319,22 +398,21 @@ impl VersionControlManager {
     ) -> anyhow::Result<Value> {
         let state = self.lock()?;
         let repository = self.ensure_repository(&state, repository_id)?;
-        let diff = Arc::clone(
-            repository
-                .diffs
-                .get(diff_id)
-                .context("diff session is no longer available")?,
-        );
+        let diff = repository
+            .diffs
+            .get(diff_id)
+            .context("diff session is no longer available")?;
         let limit = limit.clamp(1, MAX_FILE_PAGE);
-        let end = skip.saturating_add(limit).min(diff.len());
+        let total = diff_len(diff);
+        let end = skip.saturating_add(limit).min(total);
         let mut items = if skip < end {
-            diff.files().skip(skip).take(end - skip).cloned().collect()
+            diff_files_json(diff, skip, end - skip)
         } else {
             Vec::new()
         };
         let mut next = end;
         while response_size(
-            &serde_json::json!({ "items": items, "nextSkip": next, "hasMore": next < diff.len() }),
+            &serde_json::json!({ "items": items, "nextSkip": next, "hasMore": next < total }),
         ) > 60 * 1024
         {
             anyhow::ensure!(
@@ -344,7 +422,7 @@ impl VersionControlManager {
             items.pop();
             next -= 1;
         }
-        Ok(serde_json::json!({ "items": items, "nextSkip": next, "hasMore": next < diff.len() }))
+        Ok(serde_json::json!({ "items": items, "nextSkip": next, "hasMore": next < total }))
     }
 
     fn preview(
@@ -360,7 +438,11 @@ impl VersionControlManager {
             .diffs
             .get(diff_id)
             .context("diff session is no longer available")?;
-        Ok(repository.reader.preview(diff, file_id, perspective)?)
+        match (&repository.backend, diff) {
+            (RepositoryBackend::Git(reader), DiffState::Git(diff)) => Ok(reader.preview(diff, file_id, perspective)?),
+            (RepositoryBackend::Svn(repository), DiffState::Svn(diff)) => Ok(repository.preview(diff, file_id, perspective)?),
+            _ => anyhow::bail!("repository backend and diff do not match"),
+        }
     }
 
     fn prepare_export(
@@ -373,12 +455,17 @@ impl VersionControlManager {
     ) -> anyhow::Result<Value> {
         let mut state = self.lock()?;
         let repository = self.ensure_repository(&state, repository_id)?;
-        let diff = Arc::clone(
-            repository
-                .diffs
-                .get(diff_id)
-                .context("diff session is no longer available")?,
-        );
+        let RepositoryBackend::Git(reader) = &repository.backend else {
+            anyhow::bail!("SVN 导出将在下一阶段开放；当前可查看和预览 SVN 差异");
+        };
+        let DiffState::Git(diff) = repository
+            .diffs
+            .get(diff_id)
+            .context("diff session is no longer available")?
+        else {
+            anyhow::bail!("repository backend and diff do not match");
+        };
+        let diff = Arc::clone(diff);
         let options = ExportOptions {
             format,
             layout,
@@ -415,7 +502,7 @@ impl VersionControlManager {
         let Some(path) = path else {
             return Ok(serde_json::json!({ "cancelled": true }));
         };
-        let inside_repository = is_inside(path.as_path(), repository.reader.root_path());
+        let inside_repository = is_inside(path.as_path(), reader.root_path());
         let id = random_id()?;
         state.pending_exports.clear();
         state.pending_exports.insert(
@@ -450,7 +537,10 @@ impl VersionControlManager {
         );
         let reader = {
             let repository = self.ensure_repository(&state, &pending.repository_id)?;
-            repository.reader.clone()
+            match &repository.backend {
+                RepositoryBackend::Git(reader) => reader.clone(),
+                RepositoryBackend::Svn(_) => anyhow::bail!("SVN 导出不可用"),
+            }
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         state.active_export = Some(ActiveExport {
@@ -497,6 +587,7 @@ impl VersionControlManager {
         if let Ok(mut state) = self.state.lock() {
             cancel_active_export(&mut state);
             state.repository = None;
+            state.candidates.clear();
             state.pending_exports.clear();
         }
     }
@@ -621,6 +712,12 @@ async fn handle_input(
     let (request_id, task) = match input {
         BridgeInput::Hello { .. } => anyhow::bail!("hello cannot be repeated"),
         BridgeInput::SelectRepository { request_id } => (request_id, BlockingTask::Select),
+        BridgeInput::OpenRepositoryCandidate { request_id, candidate_id } => {
+            (request_id, BlockingTask::OpenCandidate(candidate_id))
+        }
+        BridgeInput::ConnectHistory { request_id, repository_id } => {
+            (request_id, BlockingTask::ConnectHistory(repository_id))
+        }
         BridgeInput::CloseRepository {
             request_id,
             repository_id,
@@ -718,6 +815,8 @@ async fn handle_input(
 
 enum BlockingTask {
     Select,
+    OpenCandidate(String),
+    ConnectHistory(String),
     Close(String),
     Overview(String),
     History(String, Option<String>, usize, usize),
@@ -735,6 +834,8 @@ enum TaskResult {
 fn run_task(manager: &VersionControlManager, task: BlockingTask) -> anyhow::Result<TaskResult> {
     let value = match task {
         BlockingTask::Select => manager.select_repository()?,
+        BlockingTask::OpenCandidate(id) => manager.open_repository_candidate(&id)?,
+        BlockingTask::ConnectHistory(id) => manager.connect_history(&id)?,
         BlockingTask::Close(id) => manager.close_repository(&id)?,
         BlockingTask::Overview(id) => manager.overview(&id)?,
         BlockingTask::History(id, query, skip, limit) => {
@@ -835,62 +936,6 @@ impl<W: Write> Write for CancellableWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
-}
-
-async fn write_preview_stream(
-    session: &Session,
-    request_id: u32,
-    content: winrisef_version_control::PreviewContent,
-) -> anyhow::Result<()> {
-    let perspective = content.perspective;
-    let original = content.original.into_bytes();
-    let modified = content.modified.into_bytes();
-    let metadata = serde_json::to_vec(&serde_json::json!({
-        "requestId": request_id,
-        "originalBytes": original.len(),
-        "modifiedBytes": modified.len(),
-        "contentType": "text/plain; charset=utf-8",
-        "perspective": perspective
-    }))?;
-    let mut send = session
-        .open_uni()
-        .await
-        .context("failed to open preview stream")?;
-    send.write_all(&(metadata.len() as u32).to_be_bytes())
-        .await?;
-    send.write_all(&metadata).await?;
-    send.write_all(&original).await?;
-    send.write_all(&modified).await?;
-    send.finish().context("failed to finish preview stream")?;
-    Ok(())
-}
-
-async fn read_frame(recv: &mut RecvStream) -> anyhow::Result<Option<BridgeInput>> {
-    let mut prefix = [0_u8; 4];
-    let Some(first) = recv.read(&mut prefix[..1]).await? else {
-        return Ok(None);
-    };
-    anyhow::ensure!(first == 1, "invalid version-control frame prefix");
-    recv.read_exact(&mut prefix[1..]).await?;
-    let len = u32::from_be_bytes(prefix) as usize;
-    anyhow::ensure!(
-        len > 0 && len <= MAX_FRAME_BYTES,
-        "invalid version-control frame length"
-    );
-    let mut bytes = vec![0_u8; len];
-    recv.read_exact(&mut bytes).await?;
-    Ok(Some(serde_json::from_slice(&bytes)?))
-}
-
-async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> anyhow::Result<()> {
-    let bytes = serde_json::to_vec(value)?;
-    anyhow::ensure!(
-        !bytes.is_empty() && bytes.len() <= MAX_FRAME_BYTES,
-        "version-control response is too large"
-    );
-    send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
-    send.write_all(&bytes).await?;
-    Ok(())
 }
 
 fn random_id() -> anyhow::Result<String> {

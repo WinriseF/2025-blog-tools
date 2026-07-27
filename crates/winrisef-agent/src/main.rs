@@ -20,11 +20,15 @@ mod native_dialog;
 mod network_endpoints;
 mod protocol_registration;
 mod server;
+mod svn_cli;
+mod svn_repository;
 #[allow(unsafe_code)]
 mod single_instance;
 mod transfer;
 mod tuning;
 mod version_control_bridge;
+mod version_control_io;
+mod version_control_helpers;
 mod version_control_server;
 
 use clap::Parser;

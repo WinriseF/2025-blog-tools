@@ -527,13 +527,13 @@ unbounded channel
 
 ## 18. Version Control 本机只读上下文
 
-Agent 支持 `winrisef://launch?...&feature=version-control`。该模式与 transfer 共用单实例互斥，但只绑定 `127.0.0.1` WebTransport 与 `/winrisef/version-control/v1`，不初始化 LAN HTTP、文件传输、地址发现或防火墙授权。重复启动通过回调返回稳定的 `agent_busy`。
+Agent 支持 `winrisef://launch?...&feature=version-control`。该模式与 transfer 共用单实例互斥，但只绑定 `127.0.0.1` WebTransport 与 `/winrisef/version-control/v2`，不初始化 LAN HTTP、文件传输、地址发现或防火墙授权。重复启动通过回调返回稳定的 `agent_busy`。
 
-`crates/winrisef-version-control` 是独立 Git 读取内核，使用仅启用本地能力的 vendored `git2/libgit2`，不启用 SSH/HTTPS/OpenSSL，也不依赖 `git.exe`。网页只能以 Agent 生成的 repository/diff/file/export ID 调用；目录和保存目标只由 `rfd` 系统对话框产生。控制帧维持 64KiB 并按序列化预算分页，源码预览走独立单向流，Git 阻塞读取在 blocking worker 中执行。`open-diff` 不得预生成或缓存所有文件的 patch 正文；历史提交比较不得逐文件读取当前 worktree status。浏览会话只保留一份有界元数据和内容定位，GitPatch 在导出开始后重建一次原生 Diff、建立路径索引并逐文件生成；命中原生 patch 时不得额外读取两侧完整正文。
+`crates/winrisef-version-control` 继续作为独立 Git 读取内核，使用仅启用本地能力的 vendored `git2/libgit2`，不启用 SSH/HTTPS/OpenSSL，也不依赖 `git.exe`。SVN 由 Agent 的 `svn_cli`/`svn_repository` 适配器调用系统 `svn.exe`，不读取 `.svn/wc.db`、不经过 shell，并固定 `--non-interactive --no-auth-cache` 与输出上限。网页只能以 Agent 生成的 repository/diff/file/export ID 调用；目录和保存目标只由 `rfd` 系统对话框产生。控制帧维持 64KiB 并按序列化预算分页，源码预览走独立单向流。目录同时包含 Git 和 SVN 时，Agent 返回候选 ID，网页必须显式选择后才打开。
 
 只读范围包含历史、HEAD/本地与已有远程引用、标签、stash、HEAD reflog 删除分支提示、工作区与冲突 stage。禁止 checkout/switch、fetch/pull/push、stage、commit、restore/reset 和 stash 写操作。导出是唯一写入例外：系统保存框、仓库内二次确认、同目录临时文件、sync 与原子完成，失败、取消或 Bridge 会话退出时清理临时文件。
 
-Git V1 支持普通仓库、linked worktree、bare 和 gitlink；预览每侧 2MiB，导出每侧 32MiB。日志不得记录源码、diff、token 或绝对路径。SVN 延后到独立阶段，当前不创建空抽象或依赖。
+Git V2 支持普通仓库、linked worktree、bare 和 gitlink；SVN V2 支持工作副本检测、状态、混合版本提示、显式确认后的线性历史和只读文本差异预览。SVN 不提供 staging、远程写操作或导出。两种后端的预览每侧 2MiB，Git 导出每侧 32MiB。日志不得记录源码、diff、token 或绝对路径。
 
 ## 19. Definition of Done
 

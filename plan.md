@@ -567,20 +567,20 @@ winrisef-agent adapters → application → winrisef-core
 
 2026-07-22 修复公网 IPv6 热点下的启动竞态：Windows Agent 不再在启动 Bridge 前同步等待 PowerShell/UAC，而是在 UDP/TCP 已绑定、HTTPS callback 已打开后异步授权防火墙；Bridge V3 snapshot 新增 `publicIpv6State`，私有 IPv4/CGNAT/ULA 立即可用，GUA 只在授权成功后发布。protocol launch 增加 per-user 单实例 mutex；网页启动改为 single-flight，保留未过期 nonce、接受迟到的合法 callback，并在 launching/connecting 阶段禁用重复开关。防火墙日志分别记录规则查询和 elevation 耗时。
 
-## 16. Version Control V1（已实施）
+## 16. Version Control V2（Git + SVN 只读）
 
 版本控制器作为与 Attachment Transfer 并列的本机有界上下文实施，不复用 Bridge V3 的传输语义：
 
 - 自定义协议增加 `feature=transfer|version-control`，默认 transfer 行为保持不变；
-- version-control 只启动 loopback WebTransport 与 Bridge V1，一次只授权一个仓库，并与 `/t` 互斥；
-- 新增 `winrisef-version-control` crate，以 vendored libgit2 提供只读历史、引用、stash、工作区分组、冲突视角、任意 revision diff、预览和导出；
+- version-control 只启动 loopback WebTransport 与 Bridge V2，一次只授权一个仓库，并与 `/t` 互斥；
+- 新增 `winrisef-version-control` crate，以 vendored libgit2 提供 Git 只读历史、引用、stash、工作区分组、冲突视角、任意 revision diff、预览和导出；Agent 侧新增 `svn_cli`/`svn_repository`，通过系统 `svn.exe` 提供 SVN 工作副本状态、线性历史、revision 比较和文本预览；
 - 控制 JSON 固定 64KiB 上限，历史与文件清单按实际序列化预算分页，正文使用独立数据流；
 - 浏览器正式入口为 `/toolbox/version-control`，交互基线为 CtxRun 的提交图、右键比较、Esc 恢复、文件树与 Monaco Diff；
 - 历史比较采用短窗口合并、单任务串行和 latest-generation 丢弃，搜索/分页也合并同页请求并忽略旧响应；Agent 仅保留最近三份单份元数据的轻量 Diff 会话，历史比较不查询当前 worktree status；打开比较不再预生成完整 patch，GitPatch 改为导出时建立路径索引并按需生成，命中时不读取两侧全文；
 - 右侧文件树按路径 Map 线性构建并预计算目录选择范围；Monaco 大文本 Diff 使用 30 秒有界计算并关闭高成本换行布局；
 - 写入只允许用户显式发起的导出，且仓库内目标需要二次确认并在完成后刷新状态。
 
-Git V1 不提供任何分支切换、远程网络、index/commit/reset/restore 或 stash 变更命令。SVN 是下一独立阶段，届时再决定 `svn.exe`、服务器访问、凭据和 branches/tags 目录语义。
+Git V2 不提供任何分支切换、远程网络、index/commit/reset/restore 或 stash 变更命令。SVN 目录检测独立于 Git；同时存在两种元数据时必须由用户在候选选择器中明确选择。SVN 历史默认不联网，用户点击“连接并读取历史”后由 Agent 原生确认并调用系统 `svn.exe`；SVN 历史沿用现有提交图组件但只使用一条线，不伪造 Git 分支。SVN 首版不支持 staging 和导出，能力通过 overview 显式返回。
 
 ## 17. 参考依据
 

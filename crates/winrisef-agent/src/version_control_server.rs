@@ -12,7 +12,7 @@ use crate::{
     version_control_bridge::{self, VersionControlManager},
 };
 
-pub const VERSION_CONTROL_PATH: &str = "/winrisef/version-control/v1";
+pub const VERSION_CONTROL_PATH: &str = "/winrisef/version-control/v2";
 
 pub async fn run(
     allowed_origin: String,

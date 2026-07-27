@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct FileSelection {
+pub(crate) struct FileSelection {
     mode: FileSelectionMode,
     ranges: Vec<[u32; 2]>,
 }
