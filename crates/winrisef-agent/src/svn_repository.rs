@@ -56,7 +56,7 @@ impl SvnRepository {
             Err(SvnError::NotInstalled) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let mut cancel = watch::channel(false).1;
+        let (_cancel_sender, mut cancel) = watch::channel(false);
         let Some(info) = block_on(cli.discover_working_copy(selected_path, &mut cancel))? else {
             return Ok(None);
         };
@@ -128,7 +128,7 @@ impl SvnRepository {
         if !self.history_connected {
             return Ok(json!({ "items": [], "nextSkip": skip, "hasMore": false }));
         }
-        let mut cancel = watch::channel(false).1;
+        let (_cancel_sender, mut cancel) = watch::channel(false);
         let start_revision = self
             .info
             .working_revision
@@ -171,7 +171,7 @@ impl SvnRepository {
     pub fn open_diff(&self, old: &Value, new: &Value, group: WorkingTreeGroup) -> anyhow::Result<SvnDiffSession> {
         let old_revision = revision_number(old);
         let new_revision = revision_number(new);
-        let mut cancel = watch::channel(false).1;
+        let (_cancel_sender, mut cancel) = watch::channel(false);
         let summary = block_on(self.cli.diff_summarize(
             &self.info.root_path.to_string_lossy(),
             old_revision,
@@ -206,7 +206,7 @@ impl SvnRepository {
     }
 
     fn status(&self) -> anyhow::Result<Vec<SvnStatusEntry>> {
-        let mut cancel = watch::channel(false).1;
+        let (_cancel_sender, mut cancel) = watch::channel(false);
         Ok(block_on(self.cli.status(&self.info.root_path, &mut cancel))?)
     }
 
@@ -231,7 +231,7 @@ impl SvnRepository {
 
     fn read_bytes(&self, path: &str, revision: Option<u64>) -> anyhow::Result<Option<Vec<u8>>> {
         let Some(revision) = revision else { return Ok(None); };
-        let mut cancel = watch::channel(false).1;
+        let (_cancel_sender, mut cancel) = watch::channel(false);
         match block_on(self.cli.cat(&self.path_for(path).to_string_lossy(), Some(revision), &mut cancel, EXPORT_LIMIT)) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(SvnError::CommandFailed { .. }) => Ok(None),
