@@ -20,6 +20,14 @@ pub struct SvnRepository {
     pub cli: SvnCli,
     pub info: SvnRepositoryInfo,
     pub history_connected: bool,
+    pub history_head_revision: Option<u64>,
+}
+
+#[derive(Clone)]
+enum SvnContentSource {
+    Empty,
+    Revision(u64),
+    Working,
 }
 
 #[derive(Clone, Serialize)]
@@ -38,10 +46,11 @@ pub struct SvnDiffFile {
     pub export_too_large: bool,
     pub has_conflict_views: bool,
     pub properties_changed: bool,
+    pub node_kind: String,
     #[serde(skip)]
-    pub base_revision: Option<u64>,
+    old_source: SvnContentSource,
     #[serde(skip)]
-    pub new_revision: Option<u64>,
+    new_source: SvnContentSource,
 }
 
 #[derive(Clone)]
@@ -64,6 +73,7 @@ impl SvnRepository {
             cli,
             info,
             history_connected: false,
+            history_head_revision: None,
         }))
     }
 
@@ -78,7 +88,7 @@ impl SvnRepository {
             .filter(|entry| entry.tree_conflicted || entry.item == "conflicted")
             .count();
         let has_untracked = status.iter().any(|entry| entry.item == "unversioned");
-        let has_changes = status.iter().any(|entry| entry.item != "normal" || entry.props != "none");
+        let has_changes = status.iter().any(status_changed);
         Ok(json!({
             "repositoryKind": "svn",
             "displayName": self.info.display_name,
@@ -116,10 +126,19 @@ impl SvnRepository {
         let host = repository_host(&self.info.repository_root_url);
         let confirmed = rfd::MessageDialog::new()
             .set_title("连接 SVN 历史")
-            .set_description(format!("将读取 SVN 历史：{host}\n\n是否允许本次会话访问网络？"))
+            .set_description(format!(
+                "将读取 SVN 历史：{host}\n\n是否允许本次会话访问网络？"
+            ))
             .set_buttons(rfd::MessageButtons::YesNo)
             .show();
-        anyhow::ensure!(matches!(confirmed, rfd::MessageDialogResult::Yes), "SVN 历史连接已取消");
+        anyhow::ensure!(
+            matches!(confirmed, rfd::MessageDialogResult::Yes),
+            "SVN 历史连接已取消"
+        );
+        let (_cancel_sender, mut cancel) = watch::channel(false);
+        self.history_head_revision = Some(block_on(
+            self.cli.head_revision(&self.info.root_path, &mut cancel),
+        )?);
         self.history_connected = true;
         Ok(self.overview()?)
     }
@@ -129,21 +148,34 @@ impl SvnRepository {
             return Ok(json!({ "items": [], "nextSkip": skip, "hasMore": false }));
         }
         let (_cancel_sender, mut cancel) = watch::channel(false);
-        let start_revision = self
-            .info
-            .working_revision
-            .saturating_sub(skip as u64)
-            .max(1);
+        let head_revision = self
+            .history_head_revision
+            .unwrap_or(self.info.working_revision);
+        let start_revision = if skip == 0 {
+            head_revision
+        } else {
+            skip as u64
+        }
+        .max(1);
         let entries = block_on(self.cli.log(
-            &self.info.root_path.to_string_lossy(),
+            &self.info.root_path,
             start_revision,
             limit.saturating_add(1).clamp(1, 32),
             false,
             &mut cancel,
         ))?;
-        let query_terms = query.unwrap_or_default().split_whitespace().map(str::to_lowercase).collect::<Vec<_>>();
+        let query_terms = query
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        let has_more = entries.len() > limit;
+        let page_entries = entries.into_iter().take(limit).collect::<Vec<_>>();
+        let next_cursor = page_entries
+            .last()
+            .map_or(0, |entry| entry.revision.saturating_sub(1));
         let mut matched = Vec::new();
-        for entry in entries {
+        for entry in page_entries {
             let hash = format!("r{}", entry.revision);
             if !query_terms.iter().all(|term| {
                 hash.to_lowercase().contains(term)
@@ -158,31 +190,110 @@ impl SvnRepository {
                 "author": truncate(&entry.author, 256),
                 "timestampMs": parse_timestamp(&entry.date),
                 "message": truncate(&entry.message, 1024),
-                "parentHashes": if entry.revision > 0 { vec![format!("r{}", entry.revision - 1)] } else { Vec::new() },
+                "parentHashes": [],
                 "refs": [],
                 "isStash": false
             }));
         }
-        let has_more = matched.len() > limit;
-        let items = matched.into_iter().take(limit).collect::<Vec<_>>();
-        Ok(json!({ "items": items, "nextSkip": skip + items.len(), "hasMore": has_more }))
+        for index in 0..matched.len() {
+            let parent = matched
+                .get(index + 1)
+                .and_then(|item| item.get("hash"))
+                .cloned()
+                .or_else(|| {
+                    (index + 1 == matched.len() && next_cursor > 0)
+                        .then(|| json!(format!("r{next_cursor}")))
+                });
+            if let (Some(parent), Some(object)) = (parent, matched[index].as_object_mut()) {
+                object.insert("parentHashes".to_owned(), json!([parent]));
+            }
+        }
+        Ok(
+            json!({ "items": matched, "nextSkip": next_cursor, "hasMore": has_more && next_cursor > 0 }),
+        )
     }
 
-    pub fn open_diff(&self, old: &Value, new: &Value, group: WorkingTreeGroup) -> anyhow::Result<SvnDiffSession> {
+    pub fn open_diff(
+        &self,
+        old: &Value,
+        new: &Value,
+        group: WorkingTreeGroup,
+    ) -> anyhow::Result<SvnDiffSession> {
         let old_revision = revision_number(old);
         let new_revision = revision_number(new);
+        let old_is_working = revision_kind(old) == Some("working-tree");
+        let new_is_working = revision_kind(new) == Some("working-tree");
+        let reverse = old_is_working && new_revision.is_some();
+        let local_base = new_is_working && old_revision == Some(self.info.working_revision);
+        let command_old_revision = if reverse {
+            new_revision
+        } else if local_base {
+            None
+        } else {
+            old_revision
+        };
+        let command_new_revision = if reverse || new_is_working {
+            None
+        } else {
+            new_revision
+        };
         let (_cancel_sender, mut cancel) = watch::channel(false);
         let summary = block_on(self.cli.diff_summarize(
-            &self.info.root_path.to_string_lossy(),
-            old_revision,
-            new_revision,
+            &self.info.root_path,
+            command_old_revision,
+            command_new_revision,
             &mut cancel,
         ))?;
-        let statuses = self.status()?.into_iter().map(|entry| (normalize_path(&self.info.root_path, &entry.path), entry)).collect::<HashMap<_, _>>();
-        let mut files = summary.into_iter().enumerate().map(|(index, entry)| {
-            let key = normalize_path(&self.info.root_path, &entry.path);
-            self.file_from_summary(index as u32, entry, statuses.get(&key), old_revision, new_revision)
-        }).collect::<anyhow::Result<Vec<_>>>()?;
+        let uses_working_copy = old_is_working || new_is_working;
+        let statuses = if uses_working_copy {
+            self.status()?
+                .into_iter()
+                .map(|entry| (normalize_path(&self.info.root_path, &entry.path), entry))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
+        let mut changes = summary
+            .into_iter()
+            .map(|entry| (normalize_path(&self.info.root_path, &entry.path), entry))
+            .collect::<HashMap<_, _>>();
+        if uses_working_copy {
+            for (path, status) in &statuses {
+                if !status_changed(status) || changes.contains_key(path) {
+                    continue;
+                }
+                changes.insert(
+                    path.clone(),
+                    SvnDiffSummaryEntry {
+                        path: path.clone(),
+                        kind: self.node_kind(path),
+                        item: status.item.clone(),
+                        props: status.props.clone(),
+                    },
+                );
+            }
+        }
+        let mut changes = changes.into_iter().collect::<Vec<_>>();
+        changes.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut files = changes
+            .into_iter()
+            .enumerate()
+            .map(|(index, (path, entry))| {
+                let status = statuses.get(&path);
+                self.file_from_summary(
+                    index as u32,
+                    path,
+                    entry,
+                    status,
+                    old_revision,
+                    new_revision,
+                    local_base,
+                    old_is_working,
+                    new_is_working,
+                    reverse,
+                )
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         if group != WorkingTreeGroup::All {
             let name = match group {
                 WorkingTreeGroup::Untracked => "untracked",
@@ -193,46 +304,173 @@ impl SvnRepository {
             };
             files.retain(|file| file.groups.iter().any(|value| value == name));
         }
+        for (file_id, file) in files.iter_mut().enumerate() {
+            file.file_id = file_id as u32;
+        }
         Ok(SvnDiffSession { files })
     }
 
-    pub fn preview(&self, session: &SvnDiffSession, file_id: u32, _perspective: ConflictPerspective) -> anyhow::Result<PreviewContent> {
-        let file = session.files.get(file_id as usize).context("SVN diff file is no longer available")?;
+    pub fn preview(
+        &self,
+        session: &SvnDiffSession,
+        file_id: u32,
+        _perspective: ConflictPerspective,
+    ) -> anyhow::Result<PreviewContent> {
+        let file = session
+            .files
+            .get(file_id as usize)
+            .context("SVN diff file is no longer available")?;
+        anyhow::ensure!(
+            file.node_kind != "dir",
+            "selected SVN change is a directory"
+        );
         anyhow::ensure!(!file.is_binary, "selected SVN file is binary");
         anyhow::ensure!(!file.preview_too_large, "selected SVN file is too large");
         let original = self.read_side(file, false)?;
         let modified = self.read_side(file, true)?;
-        Ok(PreviewContent { original, modified, perspective: ConflictPerspective::HeadToWorking })
+        Ok(PreviewContent {
+            original,
+            modified,
+            perspective: ConflictPerspective::HeadToWorking,
+        })
     }
 
     fn status(&self) -> anyhow::Result<Vec<SvnStatusEntry>> {
         let (_cancel_sender, mut cancel) = watch::channel(false);
-        Ok(block_on(self.cli.status(&self.info.root_path, &mut cancel))?)
+        Ok(block_on(
+            self.cli.status(&self.info.root_path, &mut cancel),
+        )?)
     }
 
-    fn file_from_summary(&self, file_id: u32, entry: SvnDiffSummaryEntry, status: Option<&SvnStatusEntry>, old_revision: Option<u64>, new_revision: Option<u64>) -> anyhow::Result<SvnDiffFile> {
-        let path = normalize_path(&self.info.root_path, &entry.path);
-        let base_revision = status.and_then(|item| item.revision).or(old_revision);
-        let old = self.read_bytes(&path, base_revision)?;
-        let new = if new_revision.is_some() { self.read_bytes(&path, new_revision)? } else { self.read_working_bytes(&path)? };
+    #[allow(clippy::too_many_arguments)]
+    fn file_from_summary(
+        &self,
+        file_id: u32,
+        path: String,
+        entry: SvnDiffSummaryEntry,
+        status: Option<&SvnStatusEntry>,
+        old_revision: Option<u64>,
+        new_revision: Option<u64>,
+        local_base: bool,
+        old_is_working: bool,
+        new_is_working: bool,
+        reverse: bool,
+    ) -> anyhow::Result<SvnDiffFile> {
+        let status_item = status.filter(|value| status_changed(value));
+        let mut item = status_item
+            .map(|value| value.item.as_str())
+            .unwrap_or(entry.item.as_str());
+        let properties_changed =
+            entry.props != "none" || status_item.is_some_and(|value| value.props != "none");
+        let node_kind = if entry.kind == "unknown" {
+            self.node_kind(&path)
+        } else {
+            entry.kind.clone()
+        };
+        let base_revision = if local_base {
+            status.and_then(|value| value.revision)
+        } else {
+            old_revision
+        };
+        let mut old_source = if old_is_working {
+            SvnContentSource::Working
+        } else {
+            base_revision.map_or(SvnContentSource::Empty, SvnContentSource::Revision)
+        };
+        let mut new_source = if new_is_working {
+            SvnContentSource::Working
+        } else {
+            new_revision.map_or(SvnContentSource::Empty, SvnContentSource::Revision)
+        };
+        if reverse {
+            std::mem::swap(&mut old_source, &mut new_source);
+            item = reverse_item(item);
+        }
+        match item {
+            "added" | "unversioned" => old_source = SvnContentSource::Empty,
+            "deleted" | "missing" => new_source = SvnContentSource::Empty,
+            _ => {}
+        }
+        let (old, new) = if node_kind == "dir" {
+            (None, None)
+        } else {
+            (
+                self.read_source(&path, &old_source)?,
+                self.read_source(&path, &new_source)?,
+            )
+        };
         let old_size = old.as_ref().map_or(0, Vec::len);
         let new_size = new.as_ref().map_or(0, Vec::len);
-        let is_binary = old.as_deref().is_some_and(is_binary) || new.as_deref().is_some_and(is_binary);
-        let item = status.map(|item| item.item.as_str()).unwrap_or(entry.item.as_str());
-        let status = display_status(item, &entry.props);
-        let groups = if item == "unversioned" { vec!["all".to_owned(), "untracked".to_owned()] } else if item == "conflicted" || status == "Conflicted" { vec!["all".to_owned(), "conflicted".to_owned()] } else { vec!["all".to_owned(), "unstaged".to_owned()] };
-        Ok(SvnDiffFile { file_id, path, old_path: None, status, groups, additions: 0, deletions: 0, is_binary, is_submodule: false, preview_too_large: old_size > PREVIEW_LIMIT || new_size > PREVIEW_LIMIT, export_too_large: old_size > EXPORT_LIMIT || new_size > EXPORT_LIMIT, has_conflict_views: false, properties_changed: entry.props != "none", base_revision, new_revision })
+        let is_binary =
+            old.as_deref().is_some_and(is_binary) || new.as_deref().is_some_and(is_binary);
+        let display_status = display_status(
+            item,
+            if properties_changed {
+                "modified"
+            } else {
+                "none"
+            },
+        );
+        let groups = if item == "unversioned" {
+            vec!["all".to_owned(), "untracked".to_owned()]
+        } else if item == "conflicted" || status.is_some_and(|value| value.tree_conflicted) {
+            vec!["all".to_owned(), "conflicted".to_owned()]
+        } else {
+            vec!["all".to_owned(), "unstaged".to_owned()]
+        };
+        Ok(SvnDiffFile {
+            file_id,
+            path,
+            old_path: None,
+            status: display_status,
+            groups,
+            additions: 0,
+            deletions: 0,
+            is_binary,
+            is_submodule: false,
+            preview_too_large: old_size > PREVIEW_LIMIT || new_size > PREVIEW_LIMIT,
+            export_too_large: old_size > EXPORT_LIMIT || new_size > EXPORT_LIMIT,
+            has_conflict_views: false,
+            properties_changed,
+            node_kind,
+            old_source,
+            new_source,
+        })
     }
 
     fn read_side(&self, file: &SvnDiffFile, modified: bool) -> anyhow::Result<String> {
-        let bytes = if modified { self.read_bytes(&file.path, file.new_revision)?.or_else(|| self.read_working_bytes(&file.path).ok().flatten()).unwrap_or_default() } else { self.read_bytes(&file.path, file.base_revision)?.unwrap_or_default() };
-        Ok(String::from_utf8(bytes).context("SVN file is not valid UTF-8")?.replace("\r\n", "\n"))
+        let source = if modified {
+            &file.new_source
+        } else {
+            &file.old_source
+        };
+        let bytes = self.read_source(&file.path, source)?.unwrap_or_default();
+        Ok(String::from_utf8(bytes)
+            .context("SVN file is not valid UTF-8")?
+            .replace("\r\n", "\n"))
     }
 
-    fn read_bytes(&self, path: &str, revision: Option<u64>) -> anyhow::Result<Option<Vec<u8>>> {
-        let Some(revision) = revision else { return Ok(None); };
+    fn read_source(
+        &self,
+        path: &str,
+        source: &SvnContentSource,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        match source {
+            SvnContentSource::Empty => Ok(None),
+            SvnContentSource::Working => self.read_working_bytes(path),
+            SvnContentSource::Revision(revision) => self.read_revision_bytes(path, *revision),
+        }
+    }
+
+    fn read_revision_bytes(&self, path: &str, revision: u64) -> anyhow::Result<Option<Vec<u8>>> {
         let (_cancel_sender, mut cancel) = watch::channel(false);
-        match block_on(self.cli.cat(&self.path_for(path).to_string_lossy(), Some(revision), &mut cancel, EXPORT_LIMIT)) {
+        match block_on(self.cli.cat(
+            &self.info.root_path,
+            path,
+            Some(revision),
+            &mut cancel,
+            EXPORT_LIMIT,
+        )) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(SvnError::CommandFailed { .. }) => Ok(None),
             Err(error) => Err(error.into()),
@@ -241,29 +479,112 @@ impl SvnRepository {
 
     fn read_working_bytes(&self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let target = self.path_for(path);
-        match fs::read(target) { Ok(bytes) => Ok(Some(bytes)), Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None), Err(error) => Err(error.into()) }
+        match fs::read(target) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
-    fn path_for(&self, relative: &str) -> PathBuf { self.info.root_path.join(relative) }
+    fn node_kind(&self, relative: &str) -> String {
+        self.path_for(relative)
+            .metadata()
+            .ok()
+            .map(|metadata| if metadata.is_dir() { "dir" } else { "file" })
+            .unwrap_or("file")
+            .to_owned()
+    }
+
+    fn path_for(&self, relative: &str) -> PathBuf {
+        self.info.root_path.join(relative)
+    }
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output { tokio::runtime::Handle::current().block_on(future) }
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Handle::current().block_on(future)
+}
 
-fn revision_number(value: &Value) -> Option<u64> { value.get("oid").and_then(Value::as_str).and_then(|value| value.strip_prefix('r')).and_then(|value| value.parse().ok()) }
+fn revision_number(value: &Value) -> Option<u64> {
+    value
+        .get("oid")
+        .and_then(Value::as_str)
+        .and_then(|value| value.strip_prefix('r'))
+        .and_then(|value| value.parse().ok())
+}
+
+fn revision_kind(value: &Value) -> Option<&str> {
+    value.get("kind").and_then(Value::as_str)
+}
+
+fn status_changed(value: &SvnStatusEntry) -> bool {
+    value.item != "normal" || value.props != "none" || value.tree_conflicted
+}
 
 fn normalize_path(root: &Path, value: &str) -> String {
-    let path = PathBuf::from(value);
-    path.strip_prefix(root).ok().or_else(|| path.strip_prefix(root.to_string_lossy().as_ref()).ok()).map(|path| path.to_string_lossy().replace('\\', "/")).unwrap_or_else(|| value.replace('\\', "/"))
+    let normalized = value.replace('\\', "/");
+    if normalized == "." {
+        return ".".to_owned();
+    }
+    let root = root
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_owned();
+    normalized
+        .strip_prefix(&root)
+        .map(|path| path.trim_start_matches('/').to_owned())
+        .unwrap_or(normalized)
 }
 
 fn display_status(item: &str, props: &str) -> String {
-    match item { "added" => "Added", "deleted" => "Deleted", "replaced" => "Replaced", "conflicted" => "Conflicted", "unversioned" => "Unversioned", "missing" => "Missing", "obstructed" => "Obstructed", _ if props != "none" => "Modified", _ => "Modified" }.to_owned()
+    match item {
+        "added" => "Added",
+        "deleted" => "Deleted",
+        "replaced" => "Replaced",
+        "conflicted" => "Conflicted",
+        "unversioned" => "Unversioned",
+        "missing" => "Missing",
+        "obstructed" => "Obstructed",
+        _ if props != "none" => "Modified",
+        _ => "Modified",
+    }
+    .to_owned()
 }
 
-fn is_binary(bytes: &[u8]) -> bool { bytes.contains(&0) || std::str::from_utf8(bytes).is_err() }
+fn is_binary(bytes: &[u8]) -> bool {
+    bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
+}
 
-fn repository_host(url: &str) -> &str { url.split("//").nth(1).unwrap_or(url).split('/').next().unwrap_or(url) }
+fn reverse_item(item: &str) -> &str {
+    match item {
+        "added" => "deleted",
+        "deleted" => "added",
+        _ => item,
+    }
+}
 
-fn parse_timestamp(value: &str) -> i64 { time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).map(|date| date.unix_timestamp().saturating_mul(1000)).unwrap_or(0) }
+fn repository_host(url: &str) -> &str {
+    url.split("//")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url)
+}
 
-fn truncate(value: &str, limit: usize) -> String { value.chars().take(limit).collect() }
+fn parse_timestamp(value: &str) -> i64 {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map(|date| date.unix_timestamp().saturating_mul(1000))
+        .unwrap_or(0)
+}
+
+fn truncate(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}

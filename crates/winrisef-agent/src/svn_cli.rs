@@ -1,6 +1,5 @@
 use std::{
-    env,
-    io,
+    env, io,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -13,7 +12,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::{watch, Mutex},
+    sync::{Mutex, watch},
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
@@ -121,13 +120,7 @@ impl SvnCli {
             .await?;
         if !output.status.success() {
             return Err(SvnError::CommandFailed {
-                message: String::from_utf8_lossy(&output.stderr)
-                    .lines()
-                    .last()
-                    .unwrap_or("SVN version check failed")
-                    .chars()
-                    .take(2048)
-                    .collect(),
+                message: command_error_message(&output.stderr),
             });
         }
         let version = text(&output.stdout)?
@@ -156,36 +149,55 @@ impl SvnCli {
     ) -> Result<Option<SvnRepositoryInfo>, SvnError> {
         let selected_path = canonical_existing_path(selected_path)?;
         let output = match self
-            .run(
-                &[
-                    "info",
-                    "--xml",
-                    "--depth",
-                    "empty",
-                    &peg_path(&selected_path)?,
-                ],
+            .run_in(
+                &["info", "--xml", "--depth", "empty", "."],
                 None,
+                Some(&selected_path),
                 cancel,
             )
             .await
         {
             Ok(output) => output,
-            Err(SvnError::CommandFailed { .. }) => return Ok(None),
+            Err(SvnError::CommandFailed { message }) if not_working_copy_error(&message) => {
+                return Ok(None);
+            }
+            Err(SvnError::CommandFailed { message }) => {
+                return Err(SvnError::CommandFailed { message });
+            }
             Err(error) => return Err(error),
         };
         let document: InfoDocument = parse_xml(&output.stdout)?;
-        let Some(entry) = document.entries.into_iter().next() else {
+        let Some(mut entry) = document.entries.into_iter().next() else {
             return Ok(None);
         };
-        let repository = entry.repository.ok_or_else(|| SvnError::InvalidWorkingCopy {
-            message: "working copy has no repository metadata".to_owned(),
-        })?;
         let root_path = entry
             .wc_info
             .as_ref()
             .and_then(|info| info.wcroot_abspath.clone())
             .map(PathBuf::from)
-            .unwrap_or(selected_path);
+            .unwrap_or_else(|| selected_path.clone());
+        if root_path != selected_path {
+            let root_output = self
+                .run_in(
+                    &["info", "--xml", "--depth", "empty", "."],
+                    None,
+                    Some(&root_path),
+                    cancel,
+                )
+                .await?;
+            if let Some(root_entry) = parse_xml::<InfoDocument>(&root_output.stdout)?
+                .entries
+                .into_iter()
+                .next()
+            {
+                entry = root_entry;
+            }
+        }
+        let repository = entry
+            .repository
+            .ok_or_else(|| SvnError::InvalidWorkingCopy {
+                message: "working copy has no repository metadata".to_owned(),
+            })?;
         let display_name = root_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -207,9 +219,8 @@ impl SvnCli {
         root_path: &Path,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<Vec<SvnStatusEntry>, SvnError> {
-        let path = peg_path(root_path)?;
         let output = self
-            .run_owned(
+            .run_owned_in(
                 vec![
                     "status".to_owned(),
                     "--xml".to_owned(),
@@ -217,9 +228,10 @@ impl SvnCli {
                     "--ignore-externals".to_owned(),
                     "--depth".to_owned(),
                     "infinity".to_owned(),
-                    path,
+                    ".".to_owned(),
                 ],
                 None,
+                root_path,
                 cancel,
             )
             .await?;
@@ -233,7 +245,7 @@ impl SvnCli {
                 SvnStatusEntry {
                     path: entry.path,
                     item: status.item.unwrap_or_else(|| "normal".to_owned()),
-                    props: status.props.unwrap_or_else(|| "none".to_owned()),
+                    props: normalize_props(status.props.as_deref().unwrap_or("none")),
                     revision: status.revision.and_then(|value| value.parse().ok()),
                     copied: status.copied,
                     switched: status.switched,
@@ -243,9 +255,39 @@ impl SvnCli {
             .collect())
     }
 
+    pub async fn head_revision(
+        &self,
+        root_path: &Path,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<u64, SvnError> {
+        let output = self
+            .run_owned_in(
+                vec![
+                    "info".to_owned(),
+                    "--xml".to_owned(),
+                    "-r".to_owned(),
+                    "HEAD".to_owned(),
+                    ".".to_owned(),
+                ],
+                None,
+                root_path,
+                cancel,
+            )
+            .await?;
+        let document: InfoDocument = parse_xml(&output.stdout)?;
+        document
+            .entries
+            .into_iter()
+            .next()
+            .and_then(|entry| entry.revision)
+            .ok_or_else(|| SvnError::InvalidWorkingCopy {
+                message: "SVN HEAD revision was not returned".to_owned(),
+            })
+    }
+
     pub async fn log(
         &self,
-        target: &str,
+        root_path: &Path,
         start_revision: u64,
         limit: usize,
         verbose: bool,
@@ -262,8 +304,8 @@ impl SvnCli {
         if verbose {
             args.push("--verbose".to_owned());
         }
-        args.push(peg_string(target)?);
-        let output = self.run_owned(args, None, cancel).await?;
+        args.push(".".to_owned());
+        let output = self.run_owned_in(args, None, root_path, cancel).await?;
         let document: LogDocument = parse_xml(&output.stdout)?;
         Ok(document
             .entries
@@ -294,6 +336,7 @@ impl SvnCli {
 
     pub async fn cat(
         &self,
+        root_path: &Path,
         target: &str,
         revision: Option<u64>,
         cancel: &mut watch::Receiver<bool>,
@@ -303,8 +346,8 @@ impl SvnCli {
         if let Some(revision) = revision {
             args.extend(["-r".to_owned(), revision.to_string()]);
         }
-        args.push(peg_string(target)?);
-        let output = self.run_owned(args, None, cancel).await?;
+        args.push(relative_target(target)?);
+        let output = self.run_owned_in(args, None, root_path, cancel).await?;
         if output.stdout.len() > limit {
             return Err(SvnError::OutputTooLarge);
         }
@@ -313,12 +356,16 @@ impl SvnCli {
 
     pub async fn diff_summarize(
         &self,
-        target: &str,
+        root_path: &Path,
         old_revision: Option<u64>,
         new_revision: Option<u64>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<Vec<SvnDiffSummaryEntry>, SvnError> {
-        let mut args = vec!["diff".to_owned(), "--xml".to_owned(), "--summarize".to_owned(), "--internal-diff".to_owned()];
+        let mut args = vec![
+            "diff".to_owned(),
+            "--xml".to_owned(),
+            "--summarize".to_owned(),
+        ];
         if let Some(old_revision) = old_revision {
             args.push("-r".to_owned());
             args.push(match new_revision {
@@ -326,8 +373,8 @@ impl SvnCli {
                 None => old_revision.to_string(),
             });
         }
-        args.push(peg_string(target)?);
-        let output = self.run_owned(args, None, cancel).await?;
+        args.push(".".to_owned());
+        let output = self.run_owned_in(args, None, root_path, cancel).await?;
         let document: DiffDocument = parse_xml(&output.stdout)?;
         Ok(document
             .paths
@@ -349,14 +396,36 @@ impl SvnCli {
         stdin: Option<Vec<u8>>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<SvnCommandOutput, SvnError> {
-        self.run(&args.iter().map(String::as_str).collect::<Vec<_>>(), stdin, cancel)
-            .await
+        self.run_in(
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            stdin,
+            None,
+            cancel,
+        )
+        .await
     }
 
-    pub async fn run(
+    pub async fn run_owned_in(
+        &self,
+        args: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        current_dir: &Path,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<SvnCommandOutput, SvnError> {
+        self.run_in(
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            stdin,
+            Some(current_dir),
+            cancel,
+        )
+        .await
+    }
+
+    pub async fn run_in(
         &self,
         args: &[&str],
         stdin: Option<Vec<u8>>,
+        current_dir: Option<&Path>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<SvnCommandOutput, SvnError> {
         let mut command = Command::new(&self.path);
@@ -371,10 +440,19 @@ impl SvnCli {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(current_dir) = current_dir {
+            command.current_dir(current_dir);
+        }
         let mut child = command.spawn()?;
         let mut child_stdin = child.stdin.take();
-        let stdout = child.stdout.take().ok_or_else(|| io::Error::other("missing SVN stdout"))?;
-        let stderr = child.stderr.take().ok_or_else(|| io::Error::other("missing SVN stderr"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("missing SVN stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("missing SVN stderr"))?;
         let child = Arc::new(Mutex::new(child));
         if let Some(input) = stdin {
             if let Some(mut stream) = child_stdin.take() {
@@ -389,14 +467,19 @@ impl SvnCli {
         let wait_child = Arc::clone(&child);
         let wait = async move { wait_child.lock().await.wait().await.map_err(SvnError::Io) };
         let result = tokio::time::timeout(COMMAND_TIMEOUT, async {
-            tokio::select! {
-                status = wait => status,
-                changed = cancel.changed() => {
-                    if changed.is_ok() && *cancel.borrow() {
-                        child.lock().await.kill().await.map_err(SvnError::Io)?;
-                        return Err(SvnError::Cancelled);
-                    }
-                    Err(SvnError::Cancelled)
+            tokio::pin!(wait);
+            let mut cancel_open = true;
+            loop {
+                tokio::select! {
+                    status = &mut wait => break status,
+                    changed = cancel.changed(), if cancel_open => match changed {
+                        Ok(()) if *cancel.borrow() => {
+                            child.lock().await.kill().await.map_err(SvnError::Io)?;
+                            return Err(SvnError::Cancelled);
+                        }
+                        Ok(()) => continue,
+                        Err(_) => cancel_open = false,
+                    },
                 }
             }
         })
@@ -412,13 +495,7 @@ impl SvnCli {
         let stderr = stderr_task.await.map_err(join_error)??;
         if !status.success() {
             return Err(SvnError::CommandFailed {
-                message: String::from_utf8_lossy(&stderr)
-                    .lines()
-                    .last()
-                    .unwrap_or("SVN command failed")
-                    .chars()
-                    .take(2048)
-                    .collect(),
+                message: command_error_message(&stderr),
             });
         }
         Ok(SvnCommandOutput { stdout, stderr })
@@ -434,7 +511,9 @@ fn find_executable() -> Option<PathBuf> {
 }
 
 fn supported_version(version: &str) -> bool {
-    let mut parts = version.split('.').filter_map(|part| part.parse::<u32>().ok());
+    let mut parts = version
+        .split('.')
+        .filter_map(|part| part.parse::<u32>().ok());
     matches!((parts.next(), parts.next()), (Some(major), Some(minor)) if major > 1 || (major == 1 && minor >= 14))
 }
 
@@ -442,22 +521,56 @@ fn canonical_existing_path(path: &Path) -> Result<PathBuf, SvnError> {
     path.canonicalize().map_err(|_| SvnError::InvalidPath)
 }
 
-fn peg_path(path: &Path) -> Result<String, SvnError> {
-    Ok(format!("{}@", canonical_existing_path(path)?.display()))
-}
-
-fn peg_string(value: &str) -> Result<String, SvnError> {
+fn relative_target(value: &str) -> Result<String, SvnError> {
     if value.is_empty() || value.contains('\0') || value.contains('\n') || value.contains('\r') {
         return Err(SvnError::InvalidPath);
     }
-    Ok(if value.ends_with('@') {
-        value.to_owned()
-    } else {
-        format!("{value}@")
-    })
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(SvnError::InvalidPath);
+    }
+    Ok(value.replace('\\', "/"))
 }
 
-async fn read_limited<R: AsyncRead + Unpin>(mut reader: R, limit: usize) -> Result<Vec<u8>, SvnError> {
+fn normalize_props(value: &str) -> String {
+    if value == "normal" {
+        "none".to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn command_error_message(stderr: &[u8]) -> String {
+    let message = String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if message.is_empty() {
+        "SVN command failed".to_owned()
+    } else {
+        message.chars().take(2048).collect()
+    }
+}
+
+fn not_working_copy_error(message: &str) -> bool {
+    message.contains("E155007")
+}
+
+async fn read_limited<R: AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+) -> Result<Vec<u8>, SvnError> {
     let mut result = Vec::new();
     let mut buffer = [0_u8; 8192];
     loop {
