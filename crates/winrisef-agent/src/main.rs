@@ -21,6 +21,7 @@ mod network_endpoints;
 mod protocol_registration;
 mod server;
 mod svn_cli;
+mod svn_patch;
 mod svn_repository;
 #[allow(unsafe_code)]
 mod single_instance;

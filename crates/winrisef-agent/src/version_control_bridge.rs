@@ -111,6 +111,7 @@ pub(crate) enum BridgeInput {
         #[serde(rename = "fileId")]
         file_id: u32,
         perspective: ConflictPerspective,
+        mode: PreviewMode,
     },
     PrepareExport {
         #[serde(rename = "requestId")]
@@ -144,6 +145,13 @@ pub(crate) enum BridgeInput {
         #[serde(rename = "repositoryId")]
         repository_id: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PreviewMode {
+    Full,
+    Patch,
 }
 
 #[derive(Serialize)]
@@ -440,6 +448,7 @@ impl VersionControlManager {
         diff_id: &str,
         file_id: u32,
         perspective: ConflictPerspective,
+        mode: PreviewMode,
     ) -> anyhow::Result<winrisef_version_control::PreviewContent> {
         let state = self.lock()?;
         let repository = self.ensure_repository(&state, repository_id)?;
@@ -448,8 +457,13 @@ impl VersionControlManager {
             .get(diff_id)
             .context("diff session is no longer available")?;
         match (&repository.backend, diff) {
-            (RepositoryBackend::Git(reader), DiffState::Git(diff)) => Ok(reader.preview(diff, file_id, perspective)?),
-            (RepositoryBackend::Svn(repository), DiffState::Svn(diff)) => Ok(repository.preview(diff, file_id, perspective)?),
+            (RepositoryBackend::Git(reader), DiffState::Git(diff)) => {
+                Ok(reader.preview(diff, file_id, perspective)?)
+            }
+            (RepositoryBackend::Svn(repository), DiffState::Svn(diff)) => match mode {
+                PreviewMode::Full => Ok(repository.preview(diff, file_id, perspective)?),
+                PreviewMode::Patch => Ok(repository.patch_preview(diff, file_id)?),
+            },
             _ => anyhow::bail!("repository backend and diff do not match"),
         }
     }
@@ -775,9 +789,10 @@ async fn handle_input(
             diff_id,
             file_id,
             perspective,
+            mode,
         } => (
             request_id,
-            BlockingTask::Preview(repository_id, diff_id, file_id, perspective),
+            BlockingTask::Preview(repository_id, diff_id, file_id, perspective, mode),
         ),
         BridgeInput::PrepareExport {
             request_id,
@@ -832,7 +847,7 @@ enum BlockingTask {
     History(String, Option<String>, usize, usize),
     OpenDiff(String, RevisionRef, RevisionRef, WorkingTreeGroup),
     Files(String, String, usize, usize),
-    Preview(String, String, u32, ConflictPerspective),
+    Preview(String, String, u32, ConflictPerspective, PreviewMode),
     PrepareExport(String, String, ExportFormat, ExportLayout, FileSelection),
     CancelExport(String),
 }
@@ -856,12 +871,13 @@ fn run_task(manager: &VersionControlManager, task: BlockingTask) -> anyhow::Resu
         BlockingTask::Files(id, diff, skip, limit) => {
             manager.diff_files(&id, &diff, skip, limit)?
         }
-        BlockingTask::Preview(id, diff, file, perspective) => {
+        BlockingTask::Preview(id, diff, file, perspective, mode) => {
             return Ok(TaskResult::Preview(manager.preview(
                 &id,
                 &diff,
                 file,
                 perspective,
+                mode,
             )?));
         }
         BlockingTask::PrepareExport(id, diff, format, layout, selection) => {

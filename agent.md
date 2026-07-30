@@ -493,7 +493,7 @@ Agent 支持 `winrisef://launch?...&feature=version-control`。该模式与 tran
 
 只读范围包含历史、HEAD/本地与已有远程引用、标签、stash、HEAD reflog 删除分支提示、工作区与冲突 stage。禁止 checkout/switch、fetch/pull/push、stage、commit、restore/reset 和 stash 写操作。导出是唯一写入例外：系统保存框、仓库内二次确认、同目录临时文件、sync 与原子完成，失败、取消或 Bridge 会话退出时清理临时文件。
 
-Git V2 支持普通仓库、linked worktree、bare 和 gitlink；SVN V2 支持工作副本检测、状态、混合版本提示、显式确认后的线性历史和只读文本差异预览。SVN 不提供 staging、远程写操作或导出。两种后端的预览每侧 2MiB，Git 导出每侧 32MiB。日志不得记录源码、diff、token 或绝对路径。
+Git V2 支持普通仓库、linked worktree、bare 和 gitlink；SVN V2 支持工作副本检测、状态、混合版本提示、显式确认后的线性历史和只读文本差异预览。SVN 每次 Diff 只运行一次 `svn diff --git`，按文件缓存 Patch 与行数；默认“仅变更”预览不再执行 `svn cat`，完整文件模式才并行读取两侧源码。Patch 按原始字节宽容解码，单个非 UTF-8 文件不会中断整个工作区。SVN 不提供 staging、远程写操作或导出。完整源码预览每侧 2MiB，Git 导出每侧 32MiB。日志不得记录源码、diff、token 或绝对路径。
 
 ## 19. Definition of Done
 

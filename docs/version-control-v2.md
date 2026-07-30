@@ -19,11 +19,11 @@ Every request after hello has a numeric `requestId`. Repository, diff, file, rev
 
 `prepare-export` sends file selection as `{ mode: include|exclude, ranges: [[startId, endId], ...] }` with sorted, non-overlapping inclusive ranges. The browser chooses the shorter include/exclude representation, and the Agent expands and validates it against the authorized Diff. This keeps the normal all-files and directory-selection cases within the control-frame budget without accepting arbitrary paths.
 
-Diff sessions keep one bounded metadata record per changed path and the Agent retains at most three sessions. SVN status and diff-summary metadata may be reused within an open repository session; `refresh-repository` invalidates that cache. Commit-to-commit comparisons do not read or attach current worktree status. Closing the control session invalidates repository state and cancels any active export.
+Diff sessions keep one bounded metadata record per changed path and the Agent retains at most three sessions. The Agent detects and validates `svn.exe` once per process. Opening the normal BASE-to-working-copy view reuses `svn status --xml --verbose` as its authoritative file list instead of running a duplicate `svn diff --summarize`; historical and arbitrary-revision comparisons keep the summary command for authoritative A/M/D/property metadata. Each SVN Diff runs `svn diff --git` once and splits the raw bytes into per-file Patch text and text-hunk counters. Malformed byte sequences are replaced only in this review representation, so one non-UTF-8 file cannot fail the whole workspace. The Patch cache is bounded to three revision ranges and 32MiB. Unversioned working-copy text files are read locally within the preview limit because SVN omits them from `svn diff`. `refresh-repository` invalidates worktree-sensitive status, summary, Patch, and source caches. Commit-to-commit comparisons do not read or attach current worktree status. Closing the control session invalidates repository state and cancels any active export.
 
 ## Preview stream
 
-`open-file-preview` acknowledges on the control stream, then opens an Agent-to-browser unidirectional stream:
+`open-file-preview` includes `mode: patch|full`, acknowledges on the control stream, then opens an Agent-to-browser unidirectional stream:
 
 ```text
 u32 metadataLength
@@ -32,7 +32,11 @@ original UTF-8 bytes
 modified UTF-8 bytes
 ```
 
-Each side is limited to 2MiB. Binary, invalid UTF-8, and oversized files do not produce source bodies. Symlinks expose the link value and are not followed. LFS pointer files remain pointers.
+Patch mode is the default SVN review path. It streams the cached per-file Patch in `original`, leaves `modified` empty, and starts no `svn cat` command. The browser renders only hunk context and changed lines with real old/new line numbers; omitted spans are placeholders. Patch decoding is lossy by design so malformed bytes remain inspectable without aborting unrelated files.
+
+Full mode is limited to 2MiB per side. Binary, invalid UTF-8, and oversized files do not produce full source bodies. Symlinks expose the link value and are not followed. LFS pointer files remain pointers.
+
+SVN loads the two historical source sides concurrently on a preview cache miss. Complete source bodies use a repository-scoped LRU cache bounded to 64 entries and 32MiB, keyed by revision and relative path. Immutable revision entries survive a worktree refresh; working-copy entries are removed. Diff sessions keep their smaller rendered-preview cache so reopening the same file does not rebuild strings or start another command.
 
 ## Export exception
 

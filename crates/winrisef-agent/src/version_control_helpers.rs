@@ -64,6 +64,12 @@ pub(super) fn diff_summary(diff: &DiffState) -> (Value, usize) {
         if let Some(value) = summary.get_mut(key).and_then(|value| value.as_u64()) {
             summary[key] = Value::from(value + 1);
         }
+        if let Some(value) = summary.get("insertions").and_then(Value::as_u64) {
+            summary["insertions"] = Value::from(value + file.additions as u64);
+        }
+        if let Some(value) = summary.get("deletions").and_then(Value::as_u64) {
+            summary["deletions"] = Value::from(value + file.deletions as u64);
+        }
     }
     (summary, diff.files.len())
 }

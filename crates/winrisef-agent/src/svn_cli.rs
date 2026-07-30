@@ -12,12 +12,13 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::{Mutex, watch},
+    sync::{Mutex, OnceCell, watch},
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 512 * 1024;
+static SVN_CLI: OnceCell<SvnCli> = OnceCell::const_new();
 
 #[derive(Debug, Error)]
 pub enum SvnError {
@@ -109,33 +110,38 @@ pub struct SvnCommandOutput {
 
 impl SvnCli {
     pub async fn discover() -> Result<Self, SvnError> {
-        let executable = find_executable().ok_or(SvnError::NotInstalled)?;
-        let output = Command::new(&executable)
-            .args(["--version", "--quiet"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await?;
-        if !output.status.success() {
-            return Err(SvnError::CommandFailed {
-                message: command_error_message(&output.stderr),
-            });
-        }
-        let version = text(&output.stdout)?
-            .trim()
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned();
-        if !supported_version(&version) {
-            return Err(SvnError::UnsupportedVersion { version });
-        }
-        Ok(Self {
-            path: executable,
-            version,
-        })
+        Ok(SVN_CLI
+            .get_or_try_init(|| async {
+                let executable = find_executable().ok_or(SvnError::NotInstalled)?;
+                let output = Command::new(&executable)
+                    .args(["--version", "--quiet"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .output()
+                    .await?;
+                if !output.status.success() {
+                    return Err(SvnError::CommandFailed {
+                        message: command_error_message(&output.stderr),
+                    });
+                }
+                let version = text(&output.stdout)?
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                if !supported_version(&version) {
+                    return Err(SvnError::UnsupportedVersion { version });
+                }
+                Ok(SvnCli {
+                    path: executable,
+                    version,
+                })
+            })
+            .await?
+            .clone())
     }
 
     pub fn version(&self) -> &str {
@@ -388,6 +394,26 @@ impl SvnCli {
                 props: path.props.unwrap_or_else(|| "none".to_owned()),
             })
             .collect())
+    }
+
+    pub async fn diff_patch(
+        &self,
+        root_path: &Path,
+        old_revision: Option<u64>,
+        new_revision: Option<u64>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<Vec<u8>, SvnError> {
+        let mut args = vec!["diff".to_owned(), "--git".to_owned()];
+        if let Some(old_revision) = old_revision {
+            args.push("-r".to_owned());
+            args.push(match new_revision {
+                Some(new_revision) => format!("{old_revision}:{new_revision}"),
+                None => old_revision.to_string(),
+            });
+        }
+        args.push(".".to_owned());
+        let output = self.run_owned_in(args, None, root_path, cancel).await?;
+        Ok(output.stdout)
     }
 
     pub async fn run_owned(
