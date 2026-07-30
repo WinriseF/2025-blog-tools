@@ -1,6 +1,6 @@
 # WinriseF Version Control Bridge V2
 
-Version Control V2 is a local-only, read-mostly protocol exposed by the portable WinriseF Toolbox Agent. It is independent from Transfer Bridge V3.
+Version Control V2 is a local-first, read-mostly protocol exposed by the portable WinriseF Toolbox Agent. It is independent from Transfer Bridge V3. Git never contacts a remote; SVN history contacts its repository only after the explicit native confirmation described below.
 
 ## Launch and transport
 
@@ -19,7 +19,7 @@ Every request after hello has a numeric `requestId`. Repository, diff, file, rev
 
 `prepare-export` sends file selection as `{ mode: include|exclude, ranges: [[startId, endId], ...] }` with sorted, non-overlapping inclusive ranges. The browser chooses the shorter include/exclude representation, and the Agent expands and validates it against the authorized Diff. This keeps the normal all-files and directory-selection cases within the control-frame budget without accepting arbitrary paths.
 
-Diff sessions keep one bounded metadata record per changed path and the Agent retains at most three sessions. Commit-to-commit comparisons do not read or attach current worktree status. Closing the control session invalidates repository state and cancels any active export.
+Diff sessions keep one bounded metadata record per changed path and the Agent retains at most three sessions. SVN status and diff-summary metadata may be reused within an open repository session; `refresh-repository` invalidates that cache. Commit-to-commit comparisons do not read or attach current worktree status. Closing the control session invalidates repository state and cancels any active export.
 
 ## Preview stream
 

@@ -179,7 +179,7 @@ Agent 只有在四条 lane 全部成功、byte count 一致、extent coverage �
 - browser sender 在六路之间共享四个 4MiB source block，每个 session 的每 lane 最多两个 `writer.write` 同时在途；不得无界排队 Promise。
 - 每 session 固定四个 lane task；两个方向最多都是 24 个 data lane task。
 - 不创建 per-block task、thread、channel、Rust heap copy 或逐块日志。
-- Phase 0 不包含断点续传、多文件并发、逐块 hash 或逐块 ACK。
+- memory benchmark 不包含断点续传、多文件并发、逐块 hash 或逐块 ACK；正式文件能力使用独立的 Native File V1 协议。
 
 连接建立时 browser 请求 `congestionControl: "throughput"`、要求 unreliable/HTTP3 transport，并预告四条 incoming unidirectional stream。Agent 使用 BBR、1MiB initial congestion window、10ms LAN initial RTT 和同优先级 stream round-robin。每次 payload 结束只输出一条 QUIC summary，记录 RTT、cwnd、丢包、MTU、UDP batching 与流控 blocked frame；不得用 packet trace 代替该低频摘要。
 

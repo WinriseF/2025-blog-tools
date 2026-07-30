@@ -1,7 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::Context;
@@ -14,6 +15,8 @@ use crate::svn_cli::{SvnCli, SvnDiffSummaryEntry, SvnError, SvnRepositoryInfo, S
 
 const PREVIEW_LIMIT: usize = 2 * 1024 * 1024;
 const EXPORT_LIMIT: usize = 32 * 1024 * 1024;
+const PREVIEW_CACHE_LIMIT: usize = 16 * 1024 * 1024;
+const PREVIEW_CACHE_MAX_ITEMS: usize = 8;
 
 #[derive(Clone)]
 pub struct SvnRepository {
@@ -21,6 +24,9 @@ pub struct SvnRepository {
     pub info: SvnRepositoryInfo,
     pub history_connected: bool,
     pub history_head_revision: Option<u64>,
+    status_cache: Arc<Mutex<Option<Vec<SvnStatusEntry>>>>,
+    diff_summary_cache:
+        Arc<Mutex<HashMap<(Option<u64>, Option<u64>), Vec<SvnDiffSummaryEntry>>>>,
 }
 
 #[derive(Clone)]
@@ -56,6 +62,60 @@ pub struct SvnDiffFile {
 #[derive(Clone)]
 pub struct SvnDiffSession {
     pub files: Vec<SvnDiffFile>,
+    preview_cache: Arc<Mutex<PreviewCache>>,
+}
+
+struct PreviewCache {
+    items: HashMap<String, PreviewContent>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+impl PreviewCache {
+    fn new() -> Self {
+        Self {
+            items: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<PreviewContent> {
+        let value = self.items.get(key).cloned();
+        if value.is_some() {
+            self.order.retain(|item| item != key);
+            self.order.push_back(key.to_owned());
+        }
+        value
+    }
+
+    fn insert(&mut self, key: String, value: PreviewContent) {
+        let size = value.original.len().saturating_add(value.modified.len());
+        if size > PREVIEW_CACHE_LIMIT {
+            return;
+        }
+        if let Some(previous) = self.items.remove(&key) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(previous.original.len().saturating_add(previous.modified.len()));
+            self.order.retain(|item| item != &key);
+        }
+        while self.items.len() >= PREVIEW_CACHE_MAX_ITEMS
+            || self.bytes.saturating_add(size) > PREVIEW_CACHE_LIMIT
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(previous) = self.items.remove(&oldest) {
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(previous.original.len().saturating_add(previous.modified.len()));
+            }
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.order.push_back(key.clone());
+        self.items.insert(key, value);
+    }
 }
 
 impl SvnRepository {
@@ -74,7 +134,18 @@ impl SvnRepository {
             info,
             history_connected: false,
             history_head_revision: None,
+            status_cache: Arc::new(Mutex::new(None)),
+            diff_summary_cache: Arc::new(Mutex::new(HashMap::new())),
         }))
+    }
+
+    pub fn invalidate_status_cache(&self) {
+        if let Ok(mut cache) = self.status_cache.lock() {
+            *cache = None;
+        }
+        if let Ok(mut cache) = self.diff_summary_cache.lock() {
+            cache.clear();
+        }
     }
 
     pub fn overview(&self) -> anyhow::Result<Value> {
@@ -237,13 +308,7 @@ impl SvnRepository {
         } else {
             new_revision
         };
-        let (_cancel_sender, mut cancel) = watch::channel(false);
-        let summary = block_on(self.cli.diff_summarize(
-            &self.info.root_path,
-            command_old_revision,
-            command_new_revision,
-            &mut cancel,
-        ))?;
+        let summary = self.diff_summary(command_old_revision, command_new_revision)?;
         let uses_working_copy = old_is_working || new_is_working;
         let statuses = if uses_working_copy {
             self.status()?
@@ -307,14 +372,17 @@ impl SvnRepository {
         for (file_id, file) in files.iter_mut().enumerate() {
             file.file_id = file_id as u32;
         }
-        Ok(SvnDiffSession { files })
+        Ok(SvnDiffSession {
+            files,
+            preview_cache: Arc::new(Mutex::new(PreviewCache::new())),
+        })
     }
 
     pub fn preview(
         &self,
         session: &SvnDiffSession,
         file_id: u32,
-        _perspective: ConflictPerspective,
+        perspective: ConflictPerspective,
     ) -> anyhow::Result<PreviewContent> {
         let file = session
             .files
@@ -326,20 +394,63 @@ impl SvnRepository {
         );
         anyhow::ensure!(!file.is_binary, "selected SVN file is binary");
         anyhow::ensure!(!file.preview_too_large, "selected SVN file is too large");
+        let cache_key = preview_cache_key(file_id, perspective);
+        if let Ok(mut cache) = session.preview_cache.lock()
+            && let Some(content) = cache.get(&cache_key)
+        {
+            return Ok(content);
+        }
         let original = self.read_side(file, false)?;
         let modified = self.read_side(file, true)?;
-        Ok(PreviewContent {
+        let content = PreviewContent {
             original,
             modified,
             perspective: ConflictPerspective::HeadToWorking,
-        })
+        };
+        if let Ok(mut cache) = session.preview_cache.lock() {
+            cache.insert(cache_key, content.clone());
+        }
+        Ok(content)
     }
 
     fn status(&self) -> anyhow::Result<Vec<SvnStatusEntry>> {
+        if let Ok(cache) = self.status_cache.lock()
+            && let Some(entries) = cache.as_ref()
+        {
+            return Ok(entries.clone());
+        }
         let (_cancel_sender, mut cancel) = watch::channel(false);
-        Ok(block_on(
+        let entries = block_on(
             self.cli.status(&self.info.root_path, &mut cancel),
-        )?)
+        )?;
+        if let Ok(mut cache) = self.status_cache.lock() {
+            *cache = Some(entries.clone());
+        }
+        Ok(entries)
+    }
+
+    fn diff_summary(
+        &self,
+        old_revision: Option<u64>,
+        new_revision: Option<u64>,
+    ) -> anyhow::Result<Vec<SvnDiffSummaryEntry>> {
+        let key = (old_revision, new_revision);
+        if let Ok(cache) = self.diff_summary_cache.lock()
+            && let Some(entries) = cache.get(&key)
+        {
+            return Ok(entries.clone());
+        }
+        let (_cancel_sender, mut cancel) = watch::channel(false);
+        let entries = block_on(self.cli.diff_summarize(
+            &self.info.root_path,
+            old_revision,
+            new_revision,
+            &mut cancel,
+        ))?;
+        if let Ok(mut cache) = self.diff_summary_cache.lock() {
+            cache.insert(key, entries.clone());
+        }
+        Ok(entries)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -391,18 +502,8 @@ impl SvnRepository {
             "deleted" | "missing" => new_source = SvnContentSource::Empty,
             _ => {}
         }
-        let (old, new) = if node_kind == "dir" {
-            (None, None)
-        } else {
-            (
-                self.read_source(&path, &old_source)?,
-                self.read_source(&path, &new_source)?,
-            )
-        };
-        let old_size = old.as_ref().map_or(0, Vec::len);
-        let new_size = new.as_ref().map_or(0, Vec::len);
-        let is_binary =
-            old.as_deref().is_some_and(is_binary) || new.as_deref().is_some_and(is_binary);
+        let old_size = self.source_size(&path, &old_source);
+        let new_size = self.source_size(&path, &new_source);
         let display_status = display_status(
             item,
             if properties_changed {
@@ -426,10 +527,12 @@ impl SvnRepository {
             groups,
             additions: 0,
             deletions: 0,
-            is_binary,
+            is_binary: false,
             is_submodule: false,
-            preview_too_large: old_size > PREVIEW_LIMIT || new_size > PREVIEW_LIMIT,
-            export_too_large: old_size > EXPORT_LIMIT || new_size > EXPORT_LIMIT,
+            preview_too_large: old_size.is_some_and(|size| size > PREVIEW_LIMIT)
+                || new_size.is_some_and(|size| size > PREVIEW_LIMIT),
+            export_too_large: old_size.is_some_and(|size| size > EXPORT_LIMIT)
+                || new_size.is_some_and(|size| size > EXPORT_LIMIT),
             has_conflict_views: false,
             properties_changed,
             node_kind,
@@ -445,6 +548,7 @@ impl SvnRepository {
             &file.old_source
         };
         let bytes = self.read_source(&file.path, source)?.unwrap_or_default();
+        anyhow::ensure!(!bytes.contains(&0), "SVN file is binary");
         Ok(String::from_utf8(bytes)
             .context("SVN file is not valid UTF-8")?
             .replace("\r\n", "\n"))
@@ -479,6 +583,29 @@ impl SvnRepository {
 
     fn read_working_bytes(&self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let target = self.path_for(path);
+        let metadata = match fs::symlink_metadata(&target) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(Some(
+                fs::read_link(target)?
+                    .to_string_lossy()
+                    .into_owned()
+                    .into_bytes(),
+            ));
+        }
+        if !metadata.is_file() {
+            return Ok(None);
+        }
         match fs::read(target) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(error)
@@ -495,11 +622,39 @@ impl SvnRepository {
 
     fn node_kind(&self, relative: &str) -> String {
         self.path_for(relative)
-            .metadata()
+            .symlink_metadata()
             .ok()
-            .map(|metadata| if metadata.is_dir() { "dir" } else { "file" })
+            .map(|metadata| {
+                if metadata.file_type().is_symlink() {
+                    "symlink"
+                } else if metadata.is_dir() {
+                    "dir"
+                } else {
+                    "file"
+                }
+            })
             .unwrap_or("file")
             .to_owned()
+    }
+
+    fn source_size(&self, path: &str, source: &SvnContentSource) -> Option<usize> {
+        match source {
+            SvnContentSource::Empty => Some(0),
+            SvnContentSource::Revision(_) => None,
+            SvnContentSource::Working => {
+                let target = self.path_for(path);
+                let metadata = fs::symlink_metadata(&target).ok()?;
+                if metadata.file_type().is_symlink() {
+                    fs::read_link(target)
+                        .ok()
+                        .map(|link| link.to_string_lossy().len())
+                } else if metadata.is_file() {
+                    Some(usize::try_from(metadata.len()).unwrap_or(usize::MAX))
+                } else {
+                    Some(0)
+                }
+            }
+        }
     }
 
     fn path_for(&self, relative: &str) -> PathBuf {
@@ -558,10 +713,6 @@ fn display_status(item: &str, props: &str) -> String {
     .to_owned()
 }
 
-fn is_binary(bytes: &[u8]) -> bool {
-    bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
-}
-
 fn reverse_item(item: &str) -> &str {
     match item {
         "added" => "deleted",
@@ -583,6 +734,16 @@ fn parse_timestamp(value: &str) -> i64 {
     time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
         .map(|date| date.unix_timestamp().saturating_mul(1000))
         .unwrap_or(0)
+}
+
+fn preview_cache_key(file_id: u32, perspective: ConflictPerspective) -> String {
+    let perspective = match perspective {
+        ConflictPerspective::BaseToOurs => "base-to-ours",
+        ConflictPerspective::BaseToTheirs => "base-to-theirs",
+        ConflictPerspective::OursToTheirs => "ours-to-theirs",
+        ConflictPerspective::HeadToWorking => "head-to-working",
+    };
+    format!("{file_id}:{perspective}")
 }
 
 fn truncate(value: &str, limit: usize) -> String {

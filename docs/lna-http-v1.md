@@ -1,6 +1,6 @@
 # WinriseF LNA HTTP Memory Benchmark API v1
 
-状态：Chrome 142+ 默认极速测速数据面
+状态：私有 IPv4/ULA 路径上的默认极速测速数据面
 
 传输：明文 HTTP/1.1 over TCP（局域网）
 
@@ -11,7 +11,7 @@ Base path：`/winrisef/lna/v1`
 
 远端纯网页必须在用户动作下查询 `navigator.permissions.query({ name: "local-network-access" })`：
 
-- `denied`：极速模式不可用，保留普通 WebRTC，不尝试 WebTransport；
+- `denied`：不得请求私有 HTTP/ULA LNA endpoint；若 Agent 已发布并授权公网 IPv6 WebTransport endpoint，可以走该独立路径，否则保留普通 WebRTC；
 - permission descriptor 不受支持：使用 `protocol-v3.md` 的六上/六下 WebTransport；
 - `prompt` 或 `granted`：请求 `GET /probe`，成功后才进入 HTTP/TCP 测速；
 - LNA 受支持但 probe 失败：报告 Agent/防火墙/CORS 错误，不伪装成浏览器不支持。
@@ -52,7 +52,7 @@ Agent→browser memory benchmark。请求使用同样的一次性 ticket header�
 
 ## 4. 安全边界
 
-- LNA 授权由 Chrome 管理，用户拒绝后不得改协议绕过；
+- LNA 授权由 Chrome 管理，用户拒绝后不得以私有 HTTP/ULA 或伪装 permission 状态绕过；已授权的公网 IPv6 WebTransport 是独立数据面，不依赖 LNA；
 - Agent 只接受精确 Origin、固定 path/method、单一 Content-Length 和合法一次性 ticket；
 - token 不进入 URL、日志、Supabase 或 capability advertisement；
 - HTTP/TCP payload 在局域网上不加密；ticket 提供授权和防重放，但不提供机密性。这是当前以吞吐优先的明确产品取舍；

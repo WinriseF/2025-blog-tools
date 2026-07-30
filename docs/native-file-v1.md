@@ -94,7 +94,7 @@ Agent 每个请求最多租用两个 4MiB buffer。接收 `/complete` 前必须�
 
 LNA permission 结果语义不可混淆：
 
-- `denied`：本次极速不可用，禁止转 WebTransport；
+- `denied`：禁止请求私有 HTTP/ULA LNA endpoint；若存在已授权的公网 IPv6 WebTransport endpoint，可走独立的 WebTransport File V1，否则本次保持 WebRTC；
 - descriptor unsupported：使用正式 WebTransport File V1；
 - descriptor supported 但 endpoint 失败：明确报错，禁止伪装为 unsupported。
 

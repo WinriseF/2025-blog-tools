@@ -462,8 +462,17 @@ impl SvnCli {
                 });
             }
         }
-        let stdout_task = tokio::spawn(read_limited(stdout, MAX_STDOUT_BYTES));
-        let stderr_task = tokio::spawn(read_limited(stderr, MAX_STDERR_BYTES));
+        let (limit_sender, mut limit_receiver) = watch::channel(false);
+        let stdout_task = tokio::spawn(read_limited(
+            stdout,
+            MAX_STDOUT_BYTES,
+            limit_sender.clone(),
+        ));
+        let stderr_task = tokio::spawn(read_limited(
+            stderr,
+            MAX_STDERR_BYTES,
+            limit_sender,
+        ));
         let wait_child = Arc::clone(&child);
         let wait = async move { wait_child.lock().await.wait().await.map_err(SvnError::Io) };
         let result = tokio::time::timeout(COMMAND_TIMEOUT, async {
@@ -479,6 +488,12 @@ impl SvnCli {
                         }
                         Ok(()) => continue,
                         Err(_) => cancel_open = false,
+                    },
+                    changed = limit_receiver.changed() => {
+                        if changed.is_ok() && *limit_receiver.borrow() {
+                            let _ = child.lock().await.kill().await;
+                            return Err(SvnError::OutputTooLarge);
+                        }
                     },
                 }
             }
@@ -570,6 +585,7 @@ fn not_working_copy_error(message: &str) -> bool {
 async fn read_limited<R: AsyncRead + Unpin>(
     mut reader: R,
     limit: usize,
+    limit_sender: watch::Sender<bool>,
 ) -> Result<Vec<u8>, SvnError> {
     let mut result = Vec::new();
     let mut buffer = [0_u8; 8192];
@@ -579,6 +595,7 @@ async fn read_limited<R: AsyncRead + Unpin>(
             return Ok(result);
         }
         if result.len().saturating_add(count) > limit {
+            let _ = limit_sender.send(true);
             return Err(SvnError::OutputTooLarge);
         }
         result.extend_from_slice(&buffer[..count]);

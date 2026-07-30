@@ -1,8 +1,8 @@
-# WinriseF Native Transfer：项目架构与 Agent 工作说明
+# WinriseF Toolbox Agent：项目架构与工作说明
 
-更新日期：2026-07-18
+更新日期：2026-07-28
 
-适用仓库：`E:\Project\PROJECT\2026-Rust_Native_Transfer`
+适用仓库：`E:\Project\PROJECT\2025-blog-tools`
 
 关联网页：`E:\Project\PROJECT\2025-blog-public`
 
@@ -12,13 +12,13 @@
 
 任何开发者或 AI Agent 开始工作前，按以下顺序阅读：
 
-1. 本文件 `agent.md`；
-2. 根目录 `plan.md`；
-3. 网页仓库 `AGENTS.md`；
-4. 网页仓库 `ARCHITECTURE.md`；
-5. 与当前任务直接相关的源文件。
+1. 根目录 `README.md`；
+2. 本文件 `agent.md`；
+3. 与任务对应的 `docs/*.md` 协议契约；
+4. 网页仓库 `AGENTS.md` 和 `ARCHITECTURE.md`；
+5. 与当前任务直接相关的 Rust/TypeScript 源文件与 fixture。
 
-当旧桌面计划、旧注释或临时代码与 `plan.md` 冲突时，以 `plan.md` 的修订架构为准。“一次会话永远最多一个 Agent”是永久产品约束，不得把双端安装作为隐藏优化、实验模式或未来升级方向。
+本文件定义产品边界和模块职责；协议细节以对应的版本化 `docs/*.md` 与 fixture 为准；实现行为以当前代码为准。历史计划和一次性排障记录不再作为规范保留。“一次会话永远最多一个 Agent”是永久产品约束，不得把双端安装作为隐藏优化、实验模式或未来升级方向。
 
 “安装端”只是历史上的拓扑简称，实际产品不使用安装器。Windows Agent 必须保持为单个便携 EXE：首次无参数双击在当前用户范围注册自身路径并打开官网确认页，随后退出；禁止复制自身、创建服务、加入开机启动或常驻托盘。移动或重命名后由用户再次双击修复注册。
 
@@ -60,7 +60,7 @@
 
 网页项目是现有产品和 UI 的唯一来源。它已经实现：
 
-- `/t` LAN Session V11；
+- `/t` LAN Session V12；
 - Supabase Realtime Presence/Broadcast 配对；
 - WebRTC DataChannel；
 - 聊天、附件、进度、取消和同页恢复；
@@ -190,64 +190,16 @@ core domain + ports
 - application use case 只依赖 ports，不构造具体 adapter。
 - 测试通过 fake/memory ports 驱动 use case，不要求真实网络或磁盘。
 
-## 6. 目标 Rust 目录
+## 6. 当前 Rust 目录
 
-```text
-crates/
-├─ winrisef-core/
-│  └─ src/
-│     ├─ domain/
-│     │  ├─ session.rs
-│     │  ├─ peer.rs
-│     │  ├─ attachment.rs
-│     │  └─ transfer_state.rs
-│     ├─ ports/
-│     │  ├─ peer_transport.rs
-│     │  ├─ file_source.rs
-│     │  ├─ file_sink.rs
-│     │  ├─ events.rs
-│     │  └─ clock.rs
-│     ├─ protocol/
-│     │  ├─ bridge.rs
-│     │  ├─ control.rs
-│     │  ├─ data_header.rs
-│     │  └─ version.rs
-│     ├─ scheduler/
-│     │  ├─ extent.rs
-│     │  ├─ lanes.rs
-│     │  └─ buffer_pool.rs
-│     └─ lib.rs
-└─ winrisef-agent/
-   └─ src/
-      ├─ application/
-      │  ├─ start_bridge.rs
-      │  ├─ authorize_peer.rs
-      │  ├─ send_attachment.rs
-      │  ├─ receive_attachment.rs
-      │  └─ cancel_transfer.rs
-      ├─ adapters/
-      │  ├─ webtransport/
-      │  │  ├─ endpoint.rs
-      │  │  ├─ local_bridge.rs
-      │  │  ├─ peer_session.rs
-      │  │  ├─ certificate.rs
-      │  │  └─ tuning.rs
-      │  ├─ file_io/
-      │  │  ├─ mod.rs
-      │  │  ├─ reader.rs
-      │  │  ├─ writer.rs
-      │  │  ├─ windows.rs
-      │  │  └─ unix.rs
-      │  ├─ file_picker.rs
-      │  ├─ launch.rs
-      │  └─ telemetry.rs
-      ├─ bootstrap.rs
-      ├─ config.rs
-      ├─ error.rs
-      └─ main.rs
-```
+Cargo workspace 只包含四个 crate：
 
-不要为了目录图机械创建空模块。模块在对应 Phase 需要时才增加，每个模块保持单一职责。
+- `winrisef-core`：二进制协议、extent 覆盖检查与调度的纯逻辑；
+- `winrisef-platform`：Windows 相关平台能力；
+- `winrisef-agent`：启动、证书、认证、Bridge、LNA/HTTP、WebTransport、文件 I/O、系统对话框、诊断和 Version Control 适配器；
+- `winrisef-version-control`：vendored libgit2 的只读 Git 内核。
+
+`crates/winrisef-transfer` 不是 Cargo workspace member，也不是当前产品路径；不要向其中增加功能。`winrisef-agent/src` 目前按运行时边界以扁平模块拆分，新增模块应遵循职责边界，而不是回填早期规划中的空目录图。
 
 ## 7. 网页集成边界
 
@@ -262,16 +214,21 @@ crates/
 - `LanCapability`：协商浏览器和增强能力；
 - `useLanTransferController`：最终装配入口。
 
-### 7.2 新增适配器建议
+### 7.2 当前网页适配器
 
 ```text
 src/lib/lan-transfer/native-agent/
 ├─ capability.ts
+├─ endpoint-validation.ts
 ├─ launch-client.ts
 ├─ local-bridge.ts
+├─ native-storage-writer.ts
+├─ peer-lna-http.ts
+├─ peer-native-file.ts
 ├─ peer-webtransport.ts
-├─ protocol.ts
-└─ bulk-transfer.ts
+├─ ports.ts
+├─ types.ts
+└─ webtransport.ts
 ```
 
 约束：
@@ -280,7 +237,7 @@ src/lib/lan-transfer/native-agent/
 - React hook 不解析二进制 extent header。
 - `local-bridge.ts` 只连接 Agent，不读取大文件 payload。
 - `peer-webtransport.ts` 只存在于纯网页 B，负责连接 Agent 和 streams。
-- `bulk-transfer.ts` 通过现有 Runtime 事件更新附件状态，不建立第二份聊天状态。
+- `peer-native-file.ts` 通过现有 Runtime 事件更新附件状态，不建立第二份聊天状态。
 - 新增增强模式不能改变未安装 Agent 用户的默认路径。
 - 网页仓库是唯一前端；Rust 仓库不得创建 benchmark 网页、管理页面或桌面窗口。
 
@@ -290,18 +247,18 @@ src/lib/lan-transfer/native-agent/
 
 ```text
 Control/chat transport: WebRTC DataChannel（始终保留）
-Primary bulk transport: Chrome 142+ LNA HTTP/1.1/TCP 多 XHR
-Compatibility bulk transport: WebTransport/QUIC 六上/六下（仅 LNA API 不受支持）
+Primary bulk transport: Chrome LNA HTTP/1.1/TCP 多 XHR（仅私有 IPv4/ULA）
+Compatibility bulk transport: WebTransport/QUIC 六上/六下（LNA descriptor 不支持，或已授权的公网 IPv6 endpoint）
 ```
 
 附件选择逻辑：
 
 1. 本端 Agent 已连接；
-2. 用户没有拒绝 LNA；若 LNA permission 名称不受支持，远端必须支持 WebTransport；
-3. LNA probe 或六路 peer WebTransport 已鉴权并 ready；
+2. LNA 允许时，私有 IPv4/ULA 的 LNA probe 已成功；若 descriptor 不支持，或 LNA 已拒绝但存在已授权的公网 IPv6 endpoint，则远端必须支持 WebTransport；
+3. 已选 LNA 或六路 peer WebTransport 已鉴权并 ready；
 4. 附件类型/大小满足增强策略；
 5. 用户没有关闭原生增强；
-6. 选择 `native-lna-http` 或 `native-webtransport`；权限拒绝、端点故障或增强关闭均使用 `webrtc`。
+6. 选择 `native-lna-http` 或 `native-webtransport`；没有可用数据面、端点故障或增强关闭时使用 `webrtc`。LNA 拒绝绝不允许私有 HTTP 兜底，但不会阻止已授权的公网 IPv6 WebTransport。
 
 第一版只将单个普通大文件送入增强路径；文字、语音、小图片继续 WebRTC，减少双数据面状态复杂度并优先保证峰值吞吐。
 
@@ -511,19 +468,22 @@ unbounded channel
 - 修改 Rust 仓库不自动授权修改网页仓库，反之亦然；根据用户明确范围行动。
 - 不删除或覆盖用户已有未提交改动。
 - 不执行安装、发布、开放防火墙、注册系统协议或生成真实证书，除非该动作处于用户明确要求的实施范围。
-- 任何可能改变正式拓扑的决定先更新 `plan.md`，再编码。
+- 任何可能改变正式拓扑的决定先更新本文件和受影响的协议契约，再编码。
 
 ## 17. 当前仓库状态
 
-架构纠正前的 `crates/winrisef-transfer` 双原生 scaffold 已删除。当前 workspace 只有：
+当前 Cargo workspace 包含：
 
 - `winrisef-core`：不依赖 Tokio/Quinn 的协议与调度核心；
+- `winrisef-platform`：Windows 平台能力；
 - `winrisef-agent`：唯一的无前端 Agent server；
+- `winrisef-version-control`：独立的只读 Git 内核；
 - `docs/protocol-v3.md`：当前网页与 Agent 的双方向六 connection WebTransport 兼容 memory benchmark 协议契约；
 - `docs/lna-http-v1.md`：Chrome 142+ 默认 LNA HTTP/TCP memory benchmark API 契约；
-- `docs/native-file-v1.md`：LAN V11、Bridge V2、正式 LNA/WT 文件协议和文件生命周期契约。
+- `docs/native-file-v1.md`：LAN V12、Bridge V3、正式 LNA/WT 文件协议和文件生命周期契约；
+- `docs/version-control-v2.md`：Git/SVN 只读 Bridge V2 契约。
 
-当前实现保留 Chrome 142+ LNA HTTP/TCP 与六连接 WebTransport memory benchmark，并已增加正式 Native File V1：Bridge V3 系统选取/保存、动态 endpoint snapshot、opaque source、全局单任务、`.part`/sync/原子完成、六 XHR/30MiB LNA 数据面，以及六 connection × 四 lane/64MiB extent 的 WebTransport 回退。Windows protocol launch 使用单实例互斥；本机 Bridge 先启动，公网 IPv6 防火墙授权随后异步完成，GUA endpoint 只在授权成功后发布。网页的 WebRTC V12 仍是唯一控制面；只有 `>=64MiB` 普通文件进入 native，图片、语音、小文件继续 WebRTC。LNA `denied` 不阻止已授权的公网 IPv6 WebTransport；其他路径失败保持 WebRTC 回退。当前仅做静态/编译验证，未由 Codex 启动 Agent、网页、浏览器或实际传输。
+当前实现保留 LNA HTTP/TCP 与六连接 WebTransport memory benchmark，并已实现正式 Native File V1：Bridge V3 系统选取/保存、动态 endpoint snapshot、opaque source、全局单任务、`.part`/sync/原子完成、六 XHR/30MiB LNA 数据面，以及六 connection × 四 lane/64MiB extent 的 WebTransport 回退。Windows protocol launch 使用单实例互斥；本机 Bridge 先启动，公网 IPv6 防火墙授权随后异步完成，GUA endpoint 只在授权成功后发布。网页的 WebRTC V12 是控制面；只有 `>=64MiB` 普通文件进入 native，图片、语音、小文件继续 WebRTC。LNA `denied` 不阻止已授权的公网 IPv6 WebTransport；其他路径失败保持 WebRTC 回退。该状态描述不代替当前设备上的人工端到端/吞吐验收。
 
 ## 18. Version Control 本机只读上下文
 
@@ -545,6 +505,6 @@ Git V2 支持普通仓库、linked worktree、bare 和 gitlink；SVN V2 支持�
 4. 安全校验和错误分类完整；
 5. buffer/task/channel 有明确上限；
 6. 按用户要求完成相称验证；
-7. 实际架构变化同步到 `plan.md`，网页变化同步到网页 `ARCHITECTURE.md`；
+7. 实际架构变化同步到本文件、受影响的协议文档，以及网页 `ARCHITECTURE.md`；
 8. 没有把临时 benchmark 代码误当生产实现；
 9. 最终交付说明修改文件、验证内容、未验证内容和下一阶段门槛。

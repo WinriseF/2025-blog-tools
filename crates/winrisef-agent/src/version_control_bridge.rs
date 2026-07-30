@@ -319,6 +319,15 @@ impl VersionControlManager {
         backend_overview(&repository.backend)
     }
 
+    fn refresh(&self, repository_id: &str) -> anyhow::Result<Value> {
+        let state = self.lock()?;
+        let repository = self.ensure_repository(&state, repository_id)?;
+        if let RepositoryBackend::Svn(repository) = &repository.backend {
+            repository.invalidate_status_cache();
+        }
+        backend_overview(&repository.backend)
+    }
+
     fn connect_history(&self, repository_id: &str) -> anyhow::Result<Value> {
         let mut state = self.lock()?;
         let repository = self.ensure_repository_mut(&mut state, repository_id)?;
@@ -725,11 +734,11 @@ async fn handle_input(
         BridgeInput::GetRepositoryOverview {
             request_id,
             repository_id,
-        }
-        | BridgeInput::RefreshRepository {
+        } => (request_id, BlockingTask::Overview(repository_id)),
+        BridgeInput::RefreshRepository {
             request_id,
             repository_id,
-        } => (request_id, BlockingTask::Overview(repository_id)),
+        } => (request_id, BlockingTask::Refresh(repository_id)),
         BridgeInput::GetHistoryPage {
             request_id,
             repository_id,
@@ -819,6 +828,7 @@ enum BlockingTask {
     ConnectHistory(String),
     Close(String),
     Overview(String),
+    Refresh(String),
     History(String, Option<String>, usize, usize),
     OpenDiff(String, RevisionRef, RevisionRef, WorkingTreeGroup),
     Files(String, String, usize, usize),
@@ -838,6 +848,7 @@ fn run_task(manager: &VersionControlManager, task: BlockingTask) -> anyhow::Resu
         BlockingTask::ConnectHistory(id) => manager.connect_history(&id)?,
         BlockingTask::Close(id) => manager.close_repository(&id)?,
         BlockingTask::Overview(id) => manager.overview(&id)?,
+        BlockingTask::Refresh(id) => manager.refresh(&id)?,
         BlockingTask::History(id, query, skip, limit) => {
             manager.history(&id, query.as_deref(), skip, limit)?
         }

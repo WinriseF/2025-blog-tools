@@ -1,6 +1,6 @@
-# WinriseF Native Transfer
+# WinriseF Toolbox Agent
 
-WinriseF Native Transfer 是与现有 `2025-blog-public` 协同工作的无前端 Rust 文件传输加速器。
+`winrisef-agent` 是与 `2025-blog-public` 协同工作的 Windows 便携本机组件。它不提供网页、WebView、桌面主窗口或独立聊天界面；所有产品 UI 都在网页仓库。
 
 ## 永久产品边界
 
@@ -9,20 +9,20 @@ WinriseF Native Transfer 是与现有 `2025-blog-public` 协同工作的无前�
 - 两端都是手机时只使用现有网页/WebRTC，Rust Agent 不参与。
 - 本仓库不提供网页、WebView、桌面窗口或独立聊天界面。
 - Agent 以单个便携 EXE 发布，不使用安装器、后台服务、托盘、开机启动或文件复制；首次双击时只为当前 Windows 用户注册自身所在路径。
-- 唯一目标是让安装端原生文件 I/O 与远端网页之间获得尽可能高的持续吞吐。
-- 断点续传、多文件并发和历史等高级能力只有在基准证明不损害热路径后才会加入。
+- 局域网互传的目标是让安装端原生文件 I/O 与远端纯网页之间获得高持续吞吐；聊天、配对与回退始终由网页 WebRTC 负责。
+- `/toolbox/version-control` 是与传输隔离的 Git/SVN 只读工作台；Git 使用 vendored libgit2，SVN 使用受控系统 `svn.exe`。
 
-详细阶段见 [plan.md](plan.md)，架构和开发规则见 [agent.md](agent.md)。
+当前架构和开发规则见 [agent.md](agent.md)。跨端协议契约见 [docs/](docs/)；版本控制 Bridge 契约见 [docs/version-control-v2.md](docs/version-control-v2.md)。
 
-## 当前可测试状态
+## 当前实现
 
-当前已经形成“单 Agent + 远端纯网页”的双向内存测速闭环：
+局域网互传已实现：
 
-- `winrisef-core`：固定二进制协议、16MiB memory-benchmark stripe、覆盖检查和正式文件阶段可复用的固定 buffer pool；
-- `winrisef-agent`：WebTransport/HTTP3 服务端、13 天以内 P-256 临时证书、Origin/token 鉴权、四条单向数据流、零拷贝测速 payload 和可选低频本地指标；
-- `winrisef://`：Windows 当前用户协议注册、网页启动回调和一次性 launch token；
-- Local Bridge：安装端网页只负责签发短期 peer ticket，不承载测速 payload；
-- 远端网页：通过现有 WebRTC 获取一次性 ticket 后，直接连接 Agent 做 browser→Agent 和 Agent→browser 测速。
+- `winrisef-core`：协议、extent 覆盖检查和有界 buffer pool；
+- `winrisef-agent`：Windows 协议注册、启动回调、P-256 临时证书、Origin/token 鉴权、Local Bridge V3、文件选择/保存、LNA HTTP、WebTransport 和本机 positional I/O；
+- Native File V1：全局单个 native transfer、`.part`、sync、原子完成与取消清理；大于等于 64MiB 的普通文件可走原生数据面；
+- Version Control Bridge V2：Git/SVN 工作副本识别、历史、Diff、文本预览，以及 Git Diff 的显式导出；
+- memory benchmark 仍保留，作为 LNA HTTP 与 WebTransport 数据面性能诊断工具，不是功能完成状态的替代品。
 
 正式 TypeScript adapter 位于：
 
@@ -42,7 +42,7 @@ Agent benchmark data  = 每 connection 4 MiB immutable Bytes，默认 24 MiB
 QUIC congestion       = BBR，1 MiB initial cwnd，10 ms initial RTT
 ```
 
-逻辑测速将总量拆到六条独立 WebTransport/QUIC connection，以六路最晚完成时间计算聚合吞吐；每条 connection 内仍使用四 lane。Agent→browser 通过 Quinn `Bytes` 所有权直接排入发送队列，不再复制整段测速数据；browser→Agent 通过 ordered `read_chunk` 直接计数并丢弃。网络流内不使用 JSON、逐块哈希、逐块 ACK 或逐块日志。测速协议见 [docs/protocol-v3.md](docs/protocol-v3.md)。正式文件数据面仍计划使用 64MiB extent。
+逻辑测速将总量拆到六条独立 WebTransport/QUIC connection，以六路最晚完成时间计算聚合吞吐；每条 connection 内仍使用四 lane。Agent→browser 通过 Quinn `Bytes` 所有权直接排入发送队列，browser→Agent 通过 ordered `read_chunk` 直接计数并丢弃。网络流内不使用 JSON、逐块哈希、逐块 ACK 或逐块日志。测速协议见 [docs/protocol-v3.md](docs/protocol-v3.md)；正式文件数据面使用独立的 64MiB extent 协议，见 [docs/native-file-v1.md](docs/native-file-v1.md)。
 
 ## 首次使用与手工测试
 
@@ -100,7 +100,7 @@ C:\Users\Flynn\Documents\WinriseF-Agent-Logs\winrisef-agent-<时间>-<PID>.log
 .\target\debug\winrisef-agent.exe unregister-protocol
 ```
 
-当前闭环是内存源/汇性能测试，不会打开真实文件。系统文件选择、NVMe positional I/O 和正式附件数据面属于后续文件 I/O 阶段。
+memory benchmark 是独立的内存源/汇性能工具。正式附件数据面已经使用系统文件选择/保存、NVMe positional I/O 和 Native File V1；它的协议与生命周期规则不复用 benchmark ticket。
 
 ## 手工 Serve 参数契约
 
