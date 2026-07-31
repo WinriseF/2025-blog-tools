@@ -293,7 +293,7 @@ fn load_export_sides(
 
 fn full_context_diff(original: &str, modified: &str) -> String {
     let diff = TextDiff::from_lines(original, modified);
-    let mut output = String::new();
+    let mut output = String::with_capacity(original.len().max(modified.len()));
     for change in diff.iter_all_changes() {
         output.push(match change.tag() {
             ChangeTag::Delete => '-',

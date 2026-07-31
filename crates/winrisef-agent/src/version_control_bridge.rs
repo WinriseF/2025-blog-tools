@@ -22,12 +22,16 @@ use winrisef_version_control::{
 
 use crate::auth::{TicketAuthority, parse_hex};
 use crate::svn_repository::{SvnDiffSession, SvnRepository};
+use crate::version_control_helpers::{
+    backend_overview, candidate_json, diff_files_json, diff_len, diff_summary,
+};
 use crate::version_control_io::{read_frame, write_frame, write_preview_stream};
-use crate::version_control_helpers::{backend_overview, candidate_json, diff_files_json, diff_len, diff_summary};
 
 mod file_selection;
+mod pagination;
 
 use file_selection::FileSelection;
+use pagination::bounded_page;
 
 const VERSION: u16 = 2;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -362,22 +366,14 @@ impl VersionControlManager {
             RepositoryBackend::Git(reader) => reader.history(query, skip, limit + 1)?,
             RepositoryBackend::Svn(_) => unreachable!(),
         };
-        let has_more = commits.len() > limit;
+        let upstream_has_more = commits.len() > limit;
         commits.truncate(limit);
-        let mut has_more = has_more;
-        while response_size(
-            &serde_json::json!({ "items": commits, "nextSkip": skip + commits.len(), "hasMore": has_more }),
-        ) > 60 * 1024
-        {
-            anyhow::ensure!(
-                commits.len() > 1,
-                "history item exceeds the control frame budget"
-            );
-            commits.pop();
-            has_more = true;
-        }
-        Ok(
-            serde_json::json!({ "items": commits, "nextSkip": skip + commits.len(), "hasMore": has_more }),
+        let full_len = commits.len();
+        bounded_page(
+            commits,
+            |len| (skip + len, upstream_has_more || len < full_len),
+            "history item exceeds the control frame budget",
+            "failed to encode the history page",
         )
     }
 
@@ -391,7 +387,9 @@ impl VersionControlManager {
         let mut state = self.lock()?;
         let repository = self.ensure_repository_mut(&mut state, repository_id)?;
         let diff = match &repository.backend {
-            RepositoryBackend::Git(reader) => DiffState::Git(Arc::new(reader.create_diff(old, new, group)?)),
+            RepositoryBackend::Git(reader) => {
+                DiffState::Git(Arc::new(reader.create_diff(old, new, group)?))
+            }
             RepositoryBackend::Svn(svn) => {
                 DiffState::Svn(Arc::new(svn.open_diff(&old, &new, group)?))
             }
@@ -424,24 +422,17 @@ impl VersionControlManager {
         let limit = limit.clamp(1, MAX_FILE_PAGE);
         let total = diff_len(diff);
         let end = skip.saturating_add(limit).min(total);
-        let mut items = if skip < end {
+        let items = if skip < end {
             diff_files_json(diff, skip, end - skip)
         } else {
             Vec::new()
         };
-        let mut next = end;
-        while response_size(
-            &serde_json::json!({ "items": items, "nextSkip": next, "hasMore": next < total }),
-        ) > 60 * 1024
-        {
-            anyhow::ensure!(
-                items.len() > 1,
-                "diff file item exceeds the control frame budget"
-            );
-            items.pop();
-            next -= 1;
-        }
-        Ok(serde_json::json!({ "items": items, "nextSkip": next, "hasMore": next < total }))
+        bounded_page(
+            items,
+            |len| (skip + len, skip + len < total),
+            "diff file item exceeds the control frame budget",
+            "failed to encode the diff file page",
+        )
     }
 
     fn preview(
@@ -451,7 +442,7 @@ impl VersionControlManager {
         file_id: u32,
         perspective: ConflictPerspective,
         mode: PreviewMode,
-    ) -> anyhow::Result<winrisef_version_control::PreviewContent> {
+    ) -> anyhow::Result<Arc<winrisef_version_control::PreviewContent>> {
         let state = self.lock()?;
         let repository = self.ensure_repository(&state, repository_id)?;
         let diff = repository
@@ -460,7 +451,7 @@ impl VersionControlManager {
             .context("diff session is no longer available")?;
         match (&repository.backend, diff) {
             (RepositoryBackend::Git(reader), DiffState::Git(diff)) => {
-                Ok(reader.preview(diff, file_id, perspective)?)
+                Ok(Arc::new(reader.preview(diff, file_id, perspective)?))
             }
             (RepositoryBackend::Svn(repository), DiffState::Svn(diff)) => match mode {
                 PreviewMode::Full => Ok(repository.preview(diff, file_id, perspective)?),
@@ -732,17 +723,19 @@ async fn handle_input(
 ) -> anyhow::Result<(
     u32,
     anyhow::Result<Value>,
-    Option<winrisef_version_control::PreviewContent>,
+    Option<Arc<winrisef_version_control::PreviewContent>>,
 )> {
     let (request_id, task) = match input {
         BridgeInput::Hello { .. } => anyhow::bail!("hello cannot be repeated"),
         BridgeInput::SelectRepository { request_id } => (request_id, BlockingTask::Select),
-        BridgeInput::OpenRepositoryCandidate { request_id, candidate_id } => {
-            (request_id, BlockingTask::OpenCandidate(candidate_id))
-        }
-        BridgeInput::ConnectHistory { request_id, repository_id } => {
-            (request_id, BlockingTask::ConnectHistory(repository_id))
-        }
+        BridgeInput::OpenRepositoryCandidate {
+            request_id,
+            candidate_id,
+        } => (request_id, BlockingTask::OpenCandidate(candidate_id)),
+        BridgeInput::ConnectHistory {
+            request_id,
+            repository_id,
+        } => (request_id, BlockingTask::ConnectHistory(repository_id)),
         BridgeInput::CloseRepository {
             request_id,
             repository_id,
@@ -855,7 +848,7 @@ enum BlockingTask {
 }
 enum TaskResult {
     Value(Value),
-    Preview(winrisef_version_control::PreviewContent),
+    Preview(Arc<winrisef_version_control::PreviewContent>),
 }
 
 fn run_task(manager: &VersionControlManager, task: BlockingTask) -> anyhow::Result<TaskResult> {
@@ -981,8 +974,4 @@ fn is_inside(path: &Path, root: &Path) -> bool {
         .unwrap_or_else(|_| parent.to_path_buf());
     let normalized_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     normalized_parent.starts_with(normalized_root)
-}
-
-fn response_size(value: &Value) -> usize {
-    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
 }

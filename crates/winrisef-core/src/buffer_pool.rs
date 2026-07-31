@@ -11,7 +11,14 @@ pub struct BufferPool {
 #[derive(Debug)]
 struct PoolInner {
     block_size: usize,
-    available: Mutex<Vec<Vec<u8>>>,
+    buffer_count: usize,
+    state: Mutex<PoolState>,
+}
+
+#[derive(Debug)]
+struct PoolState {
+    allocated: usize,
+    available: Vec<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -23,12 +30,7 @@ pub struct PooledBuffer {
 
 impl BufferPool {
     pub fn new(buffer_count: usize, block_size: usize) -> Result<Self, BufferPoolError> {
-        if buffer_count == 0 {
-            return Err(BufferPoolError::EmptyPool);
-        }
-        if block_size == 0 {
-            return Err(BufferPoolError::EmptyBuffer);
-        }
+        validate_shape(buffer_count, block_size)?;
         let mut available = Vec::with_capacity(buffer_count);
         for _ in 0..buffer_count {
             available.push(vec![0; block_size]);
@@ -36,19 +38,44 @@ impl BufferPool {
         Ok(Self {
             inner: Arc::new(PoolInner {
                 block_size,
-                available: Mutex::new(available),
+                buffer_count,
+                state: Mutex::new(PoolState {
+                    allocated: buffer_count,
+                    available,
+                }),
+            }),
+        })
+    }
+
+    pub fn new_lazy(buffer_count: usize, block_size: usize) -> Result<Self, BufferPoolError> {
+        validate_shape(buffer_count, block_size)?;
+        Ok(Self {
+            inner: Arc::new(PoolInner {
+                block_size,
+                buffer_count,
+                state: Mutex::new(PoolState {
+                    allocated: 0,
+                    available: Vec::with_capacity(buffer_count),
+                }),
             }),
         })
     }
 
     pub fn acquire(&self) -> Result<PooledBuffer, BufferPoolError> {
-        let bytes = self
+        let mut state = self
             .inner
-            .available
+            .state
             .lock()
-            .map_err(|_| BufferPoolError::Poisoned)?
-            .pop()
-            .ok_or(BufferPoolError::Exhausted)?;
+            .map_err(|_| BufferPoolError::Poisoned)?;
+        let bytes = if let Some(bytes) = state.available.pop() {
+            bytes
+        } else if state.allocated < self.inner.buffer_count {
+            state.allocated += 1;
+            drop(state);
+            vec![0; self.inner.block_size]
+        } else {
+            return Err(BufferPoolError::Exhausted);
+        };
         Ok(PooledBuffer {
             inner: Arc::clone(&self.inner),
             bytes: Some(bytes),
@@ -63,11 +90,31 @@ impl BufferPool {
     pub fn available_count(&self) -> Result<usize, BufferPoolError> {
         Ok(self
             .inner
-            .available
+            .state
             .lock()
             .map_err(|_| BufferPoolError::Poisoned)?
+            .available
             .len())
     }
+
+    pub fn allocated_count(&self) -> Result<usize, BufferPoolError> {
+        Ok(self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| BufferPoolError::Poisoned)?
+            .allocated)
+    }
+}
+
+fn validate_shape(buffer_count: usize, block_size: usize) -> Result<(), BufferPoolError> {
+    if buffer_count == 0 {
+        return Err(BufferPoolError::EmptyPool);
+    }
+    if block_size == 0 {
+        return Err(BufferPoolError::EmptyBuffer);
+    }
+    Ok(())
 }
 
 impl PooledBuffer {
@@ -122,8 +169,8 @@ impl Drop for PooledBuffer {
         let Some(bytes) = self.bytes.take() else {
             return;
         };
-        if let Ok(mut available) = self.inner.available.lock() {
-            available.push(bytes);
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.available.push(bytes);
         }
     }
 }
@@ -155,5 +202,20 @@ mod tests {
         assert_eq!(pool.acquire().unwrap_err(), BufferPoolError::Exhausted);
         drop(buffer);
         assert_eq!(pool.available_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn lazy_pool_allocates_once_and_reuses_the_buffer() {
+        let pool = BufferPool::new_lazy(1, 16).unwrap();
+        assert_eq!(pool.available_count().unwrap(), 0);
+        assert_eq!(pool.allocated_count().unwrap(), 0);
+
+        let mut buffer = pool.acquire().unwrap();
+        let pointer = buffer.full_mut().as_ptr();
+        assert_eq!(pool.allocated_count().unwrap(), 1);
+        drop(buffer);
+
+        let mut reused = pool.acquire().unwrap();
+        assert_eq!(reused.full_mut().as_ptr(), pointer);
     }
 }

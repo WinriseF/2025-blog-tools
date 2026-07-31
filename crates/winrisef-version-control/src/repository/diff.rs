@@ -461,7 +461,11 @@ pub(crate) fn load_text(
         return Err(VcsError::BinaryFile);
     }
     let text = String::from_utf8(bytes).map_err(|_| VcsError::InvalidText)?;
-    Ok(text.replace("\r\n", "\n"))
+    if text.contains("\r\n") {
+        Ok(text.replace("\r\n", "\n"))
+    } else {
+        Ok(text)
+    }
 }
 
 fn conflict_diff(

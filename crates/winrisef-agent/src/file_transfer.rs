@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
-    io,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -13,11 +12,16 @@ use std::{
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use winrisef_core::{BufferPool, PooledBuffer};
 
 use crate::{
     auth::{constant_time_equal, now_ms},
     certificate::format_hex,
 };
+
+mod positional_io;
+
+use positional_io::{positional_read, positional_write};
 
 pub const NATIVE_FILE_VERSION: u16 = 1;
 pub const FILE_IO_BLOCK_BYTES: usize = 4 * 1024 * 1024;
@@ -169,6 +173,7 @@ struct ActiveTransfer {
     webtransport_tokens: Vec<[u8; 16]>,
     webtransport_consumed: Mutex<Vec<bool>>,
     segments: SegmentTracker,
+    buffers: BufferPool,
     resource: TransferResource,
     last_activity_ms: AtomicU64,
     last_progress_ms: AtomicU64,
@@ -603,6 +608,15 @@ impl FileTransferManager {
                     NativeDataPlane::WebTransport => FILE_WEBTRANSPORT_EXTENT_BYTES,
                 },
             )?,
+            buffers: BufferPool::new_lazy(
+                match data_plane {
+                    NativeDataPlane::LnaHttp => FILE_HTTP_PARALLELISM * 2,
+                    NativeDataPlane::WebTransport => {
+                        FILE_WEBTRANSPORT_CONNECTIONS * FILE_WEBTRANSPORT_LANES_PER_CONNECTION
+                    }
+                },
+                FILE_IO_BLOCK_BYTES,
+            )?,
             resource,
             last_activity_ms: AtomicU64::new(now),
             last_progress_ms: AtomicU64::new(now),
@@ -876,6 +890,13 @@ impl SegmentLease {
         );
         self.transfer.touch()
     }
+
+    pub fn acquire_buffer(&self) -> anyhow::Result<PooledBuffer> {
+        self.transfer
+            .buffers
+            .acquire()
+            .context("native file buffer pool is exhausted")
+    }
 }
 
 impl WebTransportConnectionLease {
@@ -965,79 +986,5 @@ fn random_hex<const N: usize>() -> anyhow::Result<String> {
     Ok(format_hex(&random_bytes::<N>()?))
 }
 
-#[cfg(windows)]
-fn positional_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-    use std::os::windows::fs::FileExt;
-    file.seek_read(buffer, offset)
-}
-
-#[cfg(windows)]
-fn positional_write(file: &File, buffer: &[u8], offset: u64) -> io::Result<usize> {
-    use std::os::windows::fs::FileExt;
-    file.seek_write(buffer, offset)
-}
-
-#[cfg(unix)]
-fn positional_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-    use std::os::unix::fs::FileExt;
-    file.read_at(buffer, offset)
-}
-
-#[cfg(unix)]
-fn positional_write(file: &File, buffer: &[u8], offset: u64) -> io::Result<usize> {
-    use std::os::unix::fs::FileExt;
-    file.write_at(buffer, offset)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::SegmentTracker;
-
-    #[test]
-    fn segment_tracker_requires_exact_complete_coverage() {
-        let tracker = SegmentTracker::new(70, 30).unwrap();
-        let first = tracker.reserve(0, 30).unwrap();
-        tracker.complete(first, 30).unwrap();
-        let second = tracker.reserve(30, 30).unwrap();
-        tracker.complete(second, 30).unwrap();
-        assert!(!tracker.is_complete());
-        let third = tracker.reserve(60, 10).unwrap();
-        tracker.complete(third, 10).unwrap();
-        assert!(tracker.is_complete());
-    }
-
-    #[test]
-    fn native_file_fixture_matches_rust_constants() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../protocol-fixtures/native-file-v1.json"
-        ))
-        .unwrap();
-        assert_eq!(fixture["lanSessionVersion"], 12);
-        assert_eq!(fixture["bridgeVersion"], 3);
-        assert_eq!(fixture["fileVersion"], super::NATIVE_FILE_VERSION);
-        assert_eq!(
-            fixture["lnaHttp"]["segmentBytes"],
-            super::FILE_HTTP_SEGMENT_BYTES
-        );
-        assert_eq!(
-            fixture["lnaHttp"]["parallelism"],
-            super::FILE_HTTP_PARALLELISM
-        );
-        assert_eq!(
-            fixture["lnaHttp"]["ioBlockBytes"],
-            super::FILE_IO_BLOCK_BYTES
-        );
-        assert_eq!(
-            fixture["webTransport"]["connections"],
-            super::FILE_WEBTRANSPORT_CONNECTIONS
-        );
-        assert_eq!(
-            fixture["webTransport"]["lanesPerConnection"],
-            super::FILE_WEBTRANSPORT_LANES_PER_CONNECTION
-        );
-        assert_eq!(
-            fixture["webTransport"]["extentBytes"],
-            super::FILE_WEBTRANSPORT_EXTENT_BYTES
-        );
-    }
-}
+mod tests;

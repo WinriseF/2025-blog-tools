@@ -64,8 +64,12 @@ pub async fn start(
 }
 
 fn bind_tcp_listener(listen: SocketAddr) -> anyhow::Result<TcpListener> {
-    let socket = Socket::new(Domain::for_address(listen), Type::STREAM, Some(Protocol::TCP))
-        .with_context(|| format!("failed to create the LNA HTTP/TCP socket at {listen}"))?;
+    let socket = Socket::new(
+        Domain::for_address(listen),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )
+    .with_context(|| format!("failed to create the LNA HTTP/TCP socket at {listen}"))?;
     if listen.is_ipv6() {
         socket
             .set_only_v6(false)
@@ -164,20 +168,29 @@ async fn handle_connection(
 ) -> anyhow::Result<()> {
     let mut pending = Vec::with_capacity(MAX_HEADER_BYTES);
     loop {
-        let request = match tokio::time::timeout(IDLE_TIMEOUT, read_request(&mut stream, &mut pending)).await
-        {
-            Ok(result) => match result {
-                Ok(Some(request)) => request,
-                Ok(None) => return Ok(()),
-                Err(error) => {
-                    write_error(&mut stream, 400, "invalid_request", &error.to_string(), None).await?;
-                    return Ok(());
-                }
-            },
-            Err(_) => return Ok(()),
-        };
+        let request =
+            match tokio::time::timeout(IDLE_TIMEOUT, read_request(&mut stream, &mut pending)).await
+            {
+                Ok(result) => match result {
+                    Ok(Some(request)) => request,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        write_error(
+                            &mut stream,
+                            400,
+                            "invalid_request",
+                            &error.to_string(),
+                            None,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                },
+                Err(_) => return Ok(()),
+            };
         let keep_alive = request.keep_alive;
-        let origin_allowed = request.origin.as_deref() == Some(runtime.settings.allowed_origin.as_str());
+        let origin_allowed =
+            request.origin.as_deref() == Some(runtime.settings.allowed_origin.as_str());
         if !origin_allowed {
             tracing::warn!(%remote, origin = ?request.origin, "rejected LNA HTTP request from an untrusted Origin");
             write_error(
@@ -271,7 +284,16 @@ async fn route_request(
             .await?;
         } else {
             tracing::info!(%remote, "LNA HTTP capability probe succeeded");
-            write_response(stream, 204, "text/plain", 0, origin, request.keep_alive, &[]).await?;
+            write_response(
+                stream,
+                204,
+                "text/plain",
+                0,
+                origin,
+                request.keep_alive,
+                &[],
+            )
+            .await?;
         }
         return Ok(());
     }
@@ -453,7 +475,8 @@ async fn receive_benchmark(
     let mut remaining = total_bytes - buffered as u64;
     let mut buffer = vec![0_u8; IO_BLOCK_BYTES];
     while remaining > 0 {
-        let count = usize::try_from(remaining.min(buffer.len() as u64)).expect("read size is bounded");
+        let count =
+            usize::try_from(remaining.min(buffer.len() as u64)).expect("read size is bounded");
         let read = tokio::time::timeout(IO_TIMEOUT, stream.read(&mut buffer[..count]))
             .await
             .context("timed out reading an LNA benchmark upload")??;
@@ -515,7 +538,8 @@ async fn send_benchmark(
     let progress = monitor.progress();
     let mut remaining = total_bytes;
     while remaining > 0 {
-        let count = usize::try_from(remaining.min(zero_block.len() as u64)).expect("write size is bounded");
+        let count =
+            usize::try_from(remaining.min(zero_block.len() as u64)).expect("write size is bounded");
         tokio::time::timeout(IO_TIMEOUT, stream.write_all(&zero_block[..count]))
             .await
             .context("timed out writing an LNA benchmark download")??;
@@ -546,7 +570,10 @@ pub(crate) struct HttpRequest {
     pub(crate) keep_alive: bool,
 }
 
-async fn read_request(stream: &mut TcpStream, pending: &mut Vec<u8>) -> anyhow::Result<Option<HttpRequest>> {
+async fn read_request(
+    stream: &mut TcpStream,
+    pending: &mut Vec<u8>,
+) -> anyhow::Result<Option<HttpRequest>> {
     let header_end = loop {
         if let Some(end) = find_header_end(pending) {
             break end;
@@ -567,8 +594,8 @@ async fn read_request(stream: &mut TcpStream, pending: &mut Vec<u8>) -> anyhow::
         }
         pending.extend_from_slice(&buffer[..read]);
     };
-    let header =
-        std::str::from_utf8(&pending[..header_end]).context("HTTP headers are not valid UTF-8/ASCII")?;
+    let header = std::str::from_utf8(&pending[..header_end])
+        .context("HTTP headers are not valid UTF-8/ASCII")?;
     let request = parse_request(header)?;
     pending.drain(..header_end + 4);
     Ok(Some(request))
@@ -603,30 +630,36 @@ fn parse_request(header: &str) -> anyhow::Result<HttpRequest> {
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
             "HTTP header name is invalid"
         );
-        let name = name.to_ascii_lowercase();
         let value = value.trim();
-        match name.as_str() {
-            "origin" => set_once(&mut origin, value.to_owned(), "Origin")?,
-            TICKET_HEADER => set_once(&mut ticket, parse_hex(value, "benchmark ticket")?, "ticket")?,
-            FILE_TOKEN_HEADER => set_once(
+        if name.eq_ignore_ascii_case("origin") {
+            set_once(&mut origin, value.to_owned(), "Origin")?;
+        } else if name.eq_ignore_ascii_case(TICKET_HEADER) {
+            set_once(&mut ticket, parse_hex(value, "benchmark ticket")?, "ticket")?;
+        } else if name.eq_ignore_ascii_case(FILE_TOKEN_HEADER) {
+            set_once(
                 &mut file_token,
                 parse_hex(value, "file transfer token")?,
                 "file transfer token",
-            )?,
-            "content-length" => set_once(
+            )?;
+        } else if name.eq_ignore_ascii_case("content-length") {
+            set_once(
                 &mut content_length,
                 value.parse::<u64>().context("Content-Length is invalid")?,
                 "Content-Length",
-            )?,
-            "transfer-encoding" => transfer_encoding = true,
-            "connection" if value.eq_ignore_ascii_case("close") => connection_close = true,
-            "expect" => anyhow::bail!("Expect requests are not supported"),
-            _ => {}
+            )?;
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encoding = true;
+        } else if name.eq_ignore_ascii_case("connection") && value.eq_ignore_ascii_case("close") {
+            connection_close = true;
+        } else if name.eq_ignore_ascii_case("expect") {
+            anyhow::bail!("Expect requests are not supported");
         }
     }
     let (path, query) = target
         .split_once('?')
-        .map_or((target, None), |(path, query)| (path, Some(query.to_owned())));
+        .map_or((target, None), |(path, query)| {
+            (path, Some(query.to_owned()))
+        });
     Ok(HttpRequest {
         method: method.to_owned(),
         path: path.to_owned(),
@@ -675,7 +708,10 @@ pub(crate) async fn write_preflight(
     keep_alive: bool,
 ) -> anyhow::Result<()> {
     let headers = [
-        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS".to_owned()),
+        (
+            "Access-Control-Allow-Methods",
+            "GET, POST, OPTIONS".to_owned(),
+        ),
         (
             "Access-Control-Allow-Headers",
             "Content-Type, X-WinriseF-Ticket, X-WinriseF-Transfer-Token".to_owned(),
@@ -758,7 +794,9 @@ mod tests {
             listener.accept().await.unwrap();
             listener.accept().await.unwrap();
         });
-        let ipv4 = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let ipv4 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         let ipv6 = tokio::net::TcpStream::connect(("::1", port)).await.unwrap();
         accept.await.unwrap();
         drop((ipv4, ipv6));
@@ -779,13 +817,17 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_content_length() {
-        let request = format!("POST {BENCHMARK_PATH} HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2");
+        let request =
+            format!("POST {BENCHMARK_PATH} HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2");
         assert!(parse_request(&request).is_err());
     }
 
     #[test]
     fn accepts_only_one_download_size() {
-        assert_eq!(parse_download_bytes(Some("bytes=31457280")).unwrap(), 31_457_280);
+        assert_eq!(
+            parse_download_bytes(Some("bytes=31457280")).unwrap(),
+            31_457_280
+        );
         assert!(parse_download_bytes(Some("bytes=1&bytes=2")).is_err());
         assert!(parse_download_bytes(Some("size=1")).is_err());
     }

@@ -4,12 +4,13 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncReadExt, sync::mpsc, task::JoinSet};
 use web_transport_quinn::{RecvStream, SendStream, Session};
+use winrisef_core::PooledBuffer;
 
 use crate::auth::parse_hex;
 use crate::file_transfer::{
     FILE_IO_BLOCK_BYTES, FILE_WEBTRANSPORT_CONNECTIONS, FILE_WEBTRANSPORT_EXTENT_BYTES,
-    FILE_WEBTRANSPORT_LANES_PER_CONNECTION, FileTransferManager, NATIVE_FILE_VERSION, NativeFileDirection,
-    SegmentLease, WebTransportConnectionLease,
+    FILE_WEBTRANSPORT_LANES_PER_CONNECTION, FileTransferManager, NATIVE_FILE_VERSION,
+    NativeFileDirection, SegmentLease, WebTransportConnectionLease,
 };
 
 pub const FILE_WEBTRANSPORT_PATH: &str = "/winrisef/file/v1";
@@ -62,10 +63,11 @@ enum FileControlOutput<'a> {
 }
 
 pub async fn run_session(session: Session, files: FileTransferManager) -> anyhow::Result<()> {
-    let (mut control_send, mut control_recv) = tokio::time::timeout(AUTH_TIMEOUT, session.accept_bi())
-        .await
-        .context("timed out waiting for Native File V1 control")?
-        .context("failed to accept Native File V1 control")?;
+    let (mut control_send, mut control_recv) =
+        tokio::time::timeout(AUTH_TIMEOUT, session.accept_bi())
+            .await
+            .context("timed out waiting for Native File V1 control")?
+            .context("failed to accept Native File V1 control")?;
     let hello = tokio::time::timeout(AUTH_TIMEOUT, read_control(&mut control_recv))
         .await
         .context("timed out waiting for Native File authentication")??
@@ -152,7 +154,9 @@ pub async fn run_session(session: Session, files: FileTransferManager) -> anyhow
 
     let payload = match direction {
         NativeFileDirection::AgentToBrowser => send_connection(&session, &files, &connection).await,
-        NativeFileDirection::BrowserToAgent => receive_connection(&session, &files, &connection).await,
+        NativeFileDirection::BrowserToAgent => {
+            receive_connection(&session, &files, &connection).await
+        }
     };
     if let Err(error) = payload {
         files.fail_transfer(
@@ -226,7 +230,8 @@ async fn send_lane(
         files.commit_segment(lease)?;
     }
     send.write_all(&extent_header(END_OFFSET, 0)).await?;
-    send.finish().context("failed to finish a Native File V1 lane")?;
+    send.finish()
+        .context("failed to finish a Native File V1 lane")?;
     Ok(())
 }
 
@@ -252,7 +257,12 @@ async fn receive_connection(
             "Native File V1 lane index is duplicate or invalid"
         );
         seen[lane_index] = true;
-        lanes.spawn(receive_lane(recv, files.clone(), connection.clone(), lane_index));
+        lanes.spawn(receive_lane(
+            recv,
+            files.clone(),
+            connection.clone(),
+            lane_index,
+        ));
     }
     while let Some(result) = lanes.join_next().await {
         result.context("Native File V1 receiver lane panicked")??;
@@ -280,9 +290,9 @@ async fn receive_lane(
 }
 
 async fn send_extent(send: &mut SendStream, lease: SegmentLease) -> anyhow::Result<SegmentLease> {
-    let (payload_tx, mut payload_rx) = mpsc::channel::<Vec<u8>>(1);
-    let (recycle_tx, mut recycle_rx) = mpsc::channel::<Vec<u8>>(1);
-    recycle_tx.send(vec![0_u8; FILE_IO_BLOCK_BYTES]).await?;
+    let (payload_tx, mut payload_rx) = mpsc::channel::<PooledBuffer>(1);
+    let (recycle_tx, mut recycle_rx) = mpsc::channel::<PooledBuffer>(1);
+    recycle_tx.send(lease.acquire_buffer()?).await?;
     let worker = tokio::task::spawn_blocking(move || -> anyhow::Result<SegmentLease> {
         let mut position = lease.offset();
         let end = position + lease.len();
@@ -292,9 +302,9 @@ async fn send_extent(send: &mut SendStream, lease: SegmentLease) -> anyhow::Resu
                 .context("Native File V1 read buffer closed")?;
             let count = usize::try_from((end - position).min(FILE_IO_BLOCK_BYTES as u64))
                 .expect("file block is bounded");
-            lease.read_exact_at(&mut buffer[..count], position)?;
+            lease.read_exact_at(&mut buffer.full_mut()[..count], position)?;
             lease.touch()?;
-            buffer.truncate(count);
+            buffer.set_len(count)?;
             payload_tx
                 .blocking_send(buffer)
                 .map_err(|_| anyhow::anyhow!("Native File V1 sender closed"))?;
@@ -302,27 +312,29 @@ async fn send_extent(send: &mut SendStream, lease: SegmentLease) -> anyhow::Resu
         }
         Ok(lease)
     });
-    while let Some(mut buffer) = payload_rx.recv().await {
+    while let Some(buffer) = payload_rx.recv().await {
         send.write_all(&buffer).await?;
-        buffer.resize(FILE_IO_BLOCK_BYTES, 0);
         let _ = recycle_tx.send(buffer).await;
     }
-    worker.await.context("Native File V1 read worker panicked")?
+    worker
+        .await
+        .context("Native File V1 read worker panicked")?
 }
 
-async fn receive_extent(recv: &mut RecvStream, lease: SegmentLease) -> anyhow::Result<SegmentLease> {
+async fn receive_extent(
+    recv: &mut RecvStream,
+    lease: SegmentLease,
+) -> anyhow::Result<SegmentLease> {
     let total = lease.len();
-    let (payload_tx, mut payload_rx) = mpsc::channel::<Vec<u8>>(1);
-    let (recycle_tx, mut recycle_rx) = mpsc::channel::<Vec<u8>>(1);
-    recycle_tx.send(vec![0_u8; FILE_IO_BLOCK_BYTES]).await?;
+    let (payload_tx, mut payload_rx) = mpsc::channel::<PooledBuffer>(1);
+    let (recycle_tx, mut recycle_rx) = mpsc::channel::<PooledBuffer>(1);
+    recycle_tx.send(lease.acquire_buffer()?).await?;
     let worker = tokio::task::spawn_blocking(move || -> anyhow::Result<SegmentLease> {
         let mut position = lease.offset();
         while let Some(buffer) = payload_rx.blocking_recv() {
             lease.write_all_at(&buffer, position)?;
             lease.touch()?;
             position += buffer.len() as u64;
-            let mut buffer = buffer;
-            buffer.resize(FILE_IO_BLOCK_BYTES, 0);
             recycle_tx
                 .blocking_send(buffer)
                 .map_err(|_| anyhow::anyhow!("Native File V1 write recycler closed"))?;
@@ -339,10 +351,10 @@ async fn receive_extent(recv: &mut RecvStream, lease: SegmentLease) -> anyhow::R
             .recv()
             .await
             .context("Native File V1 write buffer closed")?;
-        let count =
-            usize::try_from(remaining.min(FILE_IO_BLOCK_BYTES as u64)).expect("file block is bounded");
-        buffer.resize(count, 0);
-        recv.read_exact(&mut buffer)
+        let count = usize::try_from(remaining.min(FILE_IO_BLOCK_BYTES as u64))
+            .expect("file block is bounded");
+        buffer.set_len(count)?;
+        recv.read_exact(&mut buffer.full_mut()[..count])
             .await
             .context("Native File V1 extent ended early")?;
         payload_tx
@@ -352,7 +364,9 @@ async fn receive_extent(recv: &mut RecvStream, lease: SegmentLease) -> anyhow::R
         remaining -= count as u64;
     }
     drop(payload_tx);
-    worker.await.context("Native File V1 write worker panicked")?
+    worker
+        .await
+        .context("Native File V1 write worker panicked")?
 }
 
 fn assigned_extents(
@@ -381,8 +395,16 @@ async fn read_extent_header(recv: &mut RecvStream) -> anyhow::Result<(u64, u64)>
     recv.read_exact(&mut header)
         .await
         .context("failed to read Native File V1 extent header")?;
-    let offset = u64::from_be_bytes(header[..8].try_into().expect("extent offset has fixed size"));
-    let len = u64::from_be_bytes(header[8..].try_into().expect("extent length has fixed size"));
+    let offset = u64::from_be_bytes(
+        header[..8]
+            .try_into()
+            .expect("extent offset has fixed size"),
+    );
+    let len = u64::from_be_bytes(
+        header[8..]
+            .try_into()
+            .expect("extent length has fixed size"),
+    );
     Ok((offset, len))
 }
 

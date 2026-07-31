@@ -90,7 +90,7 @@ base path 为 `/winrisef/file/v1`：
 
 六个 worker 在各自 keep-alive 连接上顺序处理 segment。segment index 按 `index % 6` 确定 worker；每段最大 30MiB。浏览器上传必须直接 `xhr.send(file.slice(...))`；下载响应使用 XHR ArrayBuffer，并立即按 4MiB block 写入 StorageEngine。
 
-Agent 每个请求最多租用两个 4MiB buffer。接收 `/complete` 前必须确认六个请求槽全部空闲、总 coverage 精确完成、文件长度一致，随后 sync 并在同一文件系统中原子替换 `.part`。
+Agent 每个请求最多租用两个 4MiB buffer；active transfer 使用按需创建的 12-buffer 全局池，六个 worker 的后续 segment 复用同一批内存，完成、失败或取消时统一释放。接收 `/complete` 前必须确认六个请求槽全部空闲、总 coverage 精确完成、文件长度一致，随后 sync 并在同一文件系统中原子替换 `.part`。
 
 LNA permission 结果语义不可混淆：
 
@@ -104,7 +104,7 @@ LNA permission 结果语义不可混淆：
 
 每条 connection 使用四条单向 data stream。每个 lane 的 extent 按全局 lane `connectionIndex * 4 + laneIndex` 确定性轮转；extent header 是 `8-byte offset + 8-byte length` 大端整数，末尾用 `offset = u64::MAX, length = 0` 标记。
 
-每 lane 只持有一个 4MiB buffer，总池上限 24 个、约 96MiB。任一 connection/extent 失败即取消整个 transfer。浏览器上传完成后，由 connection 0 发送 `complete`；Agent 仅在 transfer-wide coverage 完整后 sync、原子完成并返回 `transfer-complete`。
+每 lane 只持有一个 4MiB buffer，总池上限 24 个、约 96MiB。池按需创建，buffer 在同一 lane 的后续 extent 间循环复用，并随 active transfer 一起释放。任一 connection/extent 失败即取消整个 transfer。浏览器上传完成后，由 connection 0 发送 `complete`；Agent 仅在 transfer-wide coverage 完整后 sync、原子完成并返回 `transfer-complete`。
 
 ## 8. 文件生命周期
 

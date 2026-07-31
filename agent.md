@@ -1,6 +1,6 @@
 # WinriseF Toolbox Agent：项目架构与工作说明
 
-更新日期：2026-07-28
+更新日期：2026-07-31
 
 适用仓库：`E:\Project\PROJECT\2025-blog-tools`
 
@@ -387,6 +387,7 @@ unbounded channel
 
 - 网络 runtime 与磁盘 worker 分离；
 - buffer pool 和 channel 全部有界；
+- Native File V1 的 4MiB buffer 由 active transfer 按需创建并循环复用：LNA HTTP 上限为 `6 × 2 = 12` 个（48MiB），WebTransport 上限为 `6 × 4 = 24` 个（96MiB）；segment/extent 结束不得重新分配或重新清零同尺寸 buffer，transfer 结束统一释放；
 - progress 原子累计，Rust 最多每秒格式化一次；
 - 网页 UI 进度合并后更新，避免每个 stream write 触发 React render；
 - release benchmark；
@@ -483,7 +484,7 @@ unbounded channel
 - `docs/native-file-v1.md`：LAN V12、Bridge V3、正式 LNA/WT 文件协议和文件生命周期契约；
 - `docs/version-control-v2.md`：Git/SVN 只读 Bridge V2 契约。
 
-当前实现保留 LNA HTTP/TCP 与六连接 WebTransport memory benchmark，并已实现正式 Native File V1：Bridge V3 系统选取/保存、动态 endpoint snapshot、opaque source、全局单任务、`.part`/sync/原子完成、六 XHR/30MiB LNA 数据面，以及六 connection × 四 lane/64MiB extent 的 WebTransport 回退。Windows protocol launch 使用单实例互斥；本机 Bridge 先启动，公网 IPv6 防火墙授权随后异步完成，GUA endpoint 只在授权成功后发布。网页的 WebRTC V12 是控制面；只有 `>=64MiB` 普通文件进入 native，图片、语音、小文件继续 WebRTC。LNA `denied` 不阻止已授权的公网 IPv6 WebTransport；其他路径失败保持 WebRTC 回退。该状态描述不代替当前设备上的人工端到端/吞吐验收。
+当前实现保留 LNA HTTP/TCP 与六连接 WebTransport memory benchmark，并已实现正式 Native File V1：Bridge V3 系统选取/保存、动态 endpoint snapshot、opaque source、全局单任务、`.part`/sync/原子完成、六 XHR/30MiB LNA 数据面，以及六 connection × 四 lane/64MiB extent 的 WebTransport 回退。正式文件数据面使用 active-transfer 级惰性有界 buffer pool，LNA 的 12 个与 WebTransport 的 24 个 4MiB buffer 都在后续 segment/extent 中原位复用。Windows protocol launch 使用单实例互斥；本机 Bridge 先启动，公网 IPv6 防火墙授权随后异步完成，GUA endpoint 只在授权成功后发布。网页的 WebRTC V12 是控制面；只有 `>=64MiB` 普通文件进入 native，图片、语音、小文件继续 WebRTC。LNA `denied` 不阻止已授权的公网 IPv6 WebTransport；其他路径失败保持 WebRTC 回退。该状态描述不代替当前设备上的人工端到端/吞吐验收。
 
 ## 18. Version Control 本机只读上下文
 
