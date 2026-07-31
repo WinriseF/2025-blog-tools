@@ -263,7 +263,6 @@ impl SvnRepository {
                 "mixedRevision": mixed_revision,
                 "depth": self.info.depth,
                 "historyConnected": self.history_connected,
-                "cliVersion": self.cli.version(),
                 "networkRequiredForHistory": !self.history_connected
             }
         }))

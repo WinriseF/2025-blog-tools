@@ -24,8 +24,6 @@ static SVN_CLI: OnceCell<SvnCli> = OnceCell::const_new();
 pub enum SvnError {
     #[error("SVN command-line client was not found")]
     NotInstalled,
-    #[error("SVN command-line client {version} is too old; version 1.14 or newer is required")]
-    UnsupportedVersion { version: String },
     #[error("SVN working copy could not be read: {message}")]
     InvalidWorkingCopy { message: String },
     #[error("SVN command was cancelled")]
@@ -49,7 +47,6 @@ pub enum SvnError {
 #[derive(Clone, Debug)]
 pub struct SvnCli {
     path: PathBuf,
-    version: String,
 }
 
 #[derive(Clone, Debug)]
@@ -113,39 +110,10 @@ impl SvnCli {
         Ok(SVN_CLI
             .get_or_try_init(|| async {
                 let executable = find_executable().ok_or(SvnError::NotInstalled)?;
-                let output = Command::new(&executable)
-                    .args(["--version", "--quiet"])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .kill_on_drop(true)
-                    .output()
-                    .await?;
-                if !output.status.success() {
-                    return Err(SvnError::CommandFailed {
-                        message: command_error_message(&output.stderr),
-                    });
-                }
-                let version = text(&output.stdout)?
-                    .trim()
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned();
-                if !supported_version(&version) {
-                    return Err(SvnError::UnsupportedVersion { version });
-                }
-                Ok(SvnCli {
-                    path: executable,
-                    version,
-                })
+                Ok(SvnCli { path: executable })
             })
             .await?
             .clone())
-    }
-
-    pub fn version(&self) -> &str {
-        &self.version
     }
 
     pub async fn discover_working_copy(
@@ -549,13 +517,6 @@ fn find_executable() -> Option<PathBuf> {
     env::split_paths(&path)
         .map(|path| path.join(name))
         .find_map(|path| path.is_file().then(|| path.canonicalize().ok()).flatten())
-}
-
-fn supported_version(version: &str) -> bool {
-    let mut parts = version
-        .split('.')
-        .filter_map(|part| part.parse::<u32>().ok());
-    matches!((parts.next(), parts.next()), (Some(major), Some(minor)) if major > 1 || (major == 1 && minor >= 14))
 }
 
 fn canonical_existing_path(path: &Path) -> Result<PathBuf, SvnError> {
