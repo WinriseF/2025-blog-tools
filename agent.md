@@ -83,9 +83,9 @@ Agent 是无独立主窗口的本地能力提供者：
 - 管理短期证书、launch token 和 peer ticket；
 - 不连接 Supabase，不保存聊天历史，不持有网页账号凭据。
 
-Agent 不提供网页、WebView、桌面 UI 或独立聊天界面。允许的用户交互只有首次双击后打开现有官网结果页、由现有网页触发的系统文件选择/保存对话框，以及浏览器和系统权限流程。
+Agent 不提供网页、WebView、桌面 UI 或独立聊天界面。允许的用户交互只有首次双击后打开现有官网结果页、由现有网页触发的系统文件选择/保存对话框和明确授权对话框，以及浏览器和系统权限流程。
 
-Windows 系统文件对话框统一通过 `native_dialog` 适配层打开。适配层只在对话框存在期间创建一个离屏、无任务栏入口的临时 owner window，使无主窗口 Agent 发起的目录/文件/保存对话框稳定位于浏览器前方；确认、取消或错误返回后由 RAII 立即销毁 HWND。该 owner 不引入常驻窗口、消息循环或后台线程。
+Windows 原生对话框统一通过 `native_dialog` 适配层打开。EXE 清单启用 Per-Monitor V2 DPI 感知和 Common Controls v6；目录/文件/保存继续使用 Windows Common Item Dialog，明确授权使用现代 Task Dialog，不回退到旧式 `MessageBox`。适配层只在对话框存在期间创建一个离屏、无任务栏入口的临时 owner window，使无主窗口 Agent 发起的对话框稳定位于浏览器前方；确认、取消或错误返回后由 RAII 立即销毁 HWND。该 owner 不引入常驻窗口、消息循环或后台线程。
 
 ### 3.3 基础设施
 
@@ -490,11 +490,11 @@ unbounded channel
 
 Agent 支持 `winrisef://launch?...&feature=version-control`。该模式与 transfer 共用单实例互斥，但只绑定 `127.0.0.1` WebTransport 与 `/winrisef/version-control/v2`，不初始化 LAN HTTP、文件传输、地址发现或防火墙授权。重复启动通过回调返回稳定的 `agent_busy`。
 
-`crates/winrisef-version-control` 继续作为独立 Git 读取内核，使用仅启用本地能力的 vendored `git2/libgit2`，不启用 SSH/HTTPS/OpenSSL，也不依赖 `git.exe`。SVN 由 Agent 的 `svn_cli`/`svn_repository` 适配器调用系统 `svn.exe`，不读取 `.svn/wc.db`、不经过 shell，并固定 `--non-interactive --no-auth-cache`；stdout/stderr 并发排空，45 秒超时和逐流输出上限会直接终止子进程。网页只能以 Agent 生成的 repository/diff/file/export ID 调用；目录和保存目标只由 `rfd` 系统对话框产生。控制帧维持 64KiB 并按序列化预算分页，源码预览走独立单向流。目录同时包含 Git 和 SVN 时，Agent 返回候选 ID，网页必须显式选择后才打开。
+`crates/winrisef-version-control` 继续作为独立 Git 读取内核，使用仅启用本地能力的 vendored `git2/libgit2`，不启用 SSH/HTTPS/OpenSSL，也不依赖 `git.exe`。SVN 由 Agent 的 `svn_cli`/`svn_repository` 适配器调用系统 `svn.exe`，不读取 `.svn/wc.db`、不经过 shell，并固定 `--non-interactive --no-auth-cache`；Windows 上所有 SVN 子进程统一以 `CREATE_NO_WINDOW` 后台启动。普通命令的 stdout/stderr 并发排空且维持 45 秒超时；全量 `svn diff --git` 改为 64KiB 固定缓冲的增量解析，独立使用 120 秒和 512MiB 处理预算，该预算不会预分配或常驻同等内存。网页只能以 Agent 生成的 repository/diff/file/export ID 调用；目录和保存目标只由 `rfd` 系统对话框产生。控制帧维持 64KiB 并按序列化预算分页，源码预览走独立单向流。目录同时包含 Git 和 SVN 时，Agent 返回候选 ID，网页必须显式选择后才打开。
 
 只读范围包含历史、HEAD/本地与已有远程引用、标签、stash、HEAD reflog 删除分支提示、工作区与冲突 stage。禁止 checkout/switch、fetch/pull/push、stage、commit、restore/reset 和 stash 写操作。导出是唯一写入例外：系统保存框、仓库内二次确认、同目录临时文件、sync 与原子完成，失败、取消或 Bridge 会话退出时清理临时文件。
 
-Git V2 支持普通仓库、linked worktree、bare 和 gitlink；SVN V2 支持工作副本检测、状态、混合版本提示、显式确认后的线性历史和只读文本差异预览。SVN revision 使用强类型入口：`empty` 映射 r0、commit 必须为十进制 `r<N>`，working tree 只允许位于右侧。工作区 Diff 同时用 status 补充未跟踪/冲突信息、用 summarize 保留删除目录等权威节点类型；每次 Diff 只运行一次 `svn diff --git`，按文件缓存 Patch、行数和二进制元数据。默认“仅变更”预览不执行 `svn cat`，完整文件模式才并行读取两侧源码。Patch 与完整源码均宽容替换非 UTF-8 字节；二进制/NUL 文件仍拒绝文本预览。SVN 不提供 staging、远程写操作或导出。完整源码预览每侧 2MiB，Git 导出每侧 32MiB。日志不得记录源码、diff、token 或绝对路径。
+Git V2 支持普通仓库、linked worktree、bare 和 gitlink；SVN V2 支持工作副本检测、状态、混合版本提示、显式确认后的线性历史和只读文本差异预览。SVN revision 使用强类型入口：`empty` 映射 r0、commit 必须为十进制 `r<N>`，working tree 只允许位于右侧。工作区 Diff 同时用 status 补充未跟踪/冲突信息、用 summarize 保留删除目录等权威节点类型；每次 Diff 只运行一次全量 `svn diff --git`，流式统计全部文件的行数和二进制元数据，但单文件只保留最多 2MiB Patch，三个 revision range 共享 32MiB Patch 缓存。“仅变更”预览优先命中该缓存；未常驻的文件只在点击时执行一次按路径限定的 `svn diff`，结果进入当前 Diff Session 的预览缓存。完整文件模式才并行读取两侧源码。Patch 与完整源码均宽容替换非 UTF-8 字节；二进制/NUL 文件仍拒绝文本预览。SVN 不提供 staging、远程写操作或导出。完整源码预览每侧 2MiB，Git 导出每侧 32MiB。日志不得记录源码、diff、token 或绝对路径。
 
 ## 19. Definition of Done
 

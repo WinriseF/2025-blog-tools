@@ -23,7 +23,7 @@ mime_guess = "2.0.5"
 quick-xml = { version = "0.38.3", features = ["serialize"] }
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
-rfd = { version = "0.17.2", default-features = false }
+rfd = { version = "0.17.2", default-features = false, features = ["common-controls-v6"] }
 raw-window-handle = "0.6.2"
 rustls = { version = "0.23.42", default-features = false, features = ["std", "ring"] }
 serde = { version = "1.0.228", features = ["derive"] }

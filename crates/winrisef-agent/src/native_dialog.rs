@@ -12,6 +12,20 @@ pub fn save_file(dialog: rfd::FileDialog) -> Option<PathBuf> {
     show(dialog, rfd::FileDialog::save_file)
 }
 
+pub fn confirm(title: &str, description: String, confirm_label: &str) -> bool {
+    let confirm_label = confirm_label.to_owned();
+    let result = show_message(
+        rfd::MessageDialog::new()
+            .set_title(title)
+            .set_description(description)
+            .set_buttons(rfd::MessageButtons::OkCancelCustom(
+                confirm_label.clone(),
+                "取消".to_owned(),
+            )),
+    );
+    matches!(result, rfd::MessageDialogResult::Custom(label) if label == confirm_label)
+}
+
 #[cfg(target_os = "windows")]
 fn show<T>(dialog: rfd::FileDialog, open: impl FnOnce(rfd::FileDialog) -> T) -> T {
     let Some(owner) = windows::DialogOwner::new() else {
@@ -21,9 +35,23 @@ fn show<T>(dialog: rfd::FileDialog, open: impl FnOnce(rfd::FileDialog) -> T) -> 
     open(dialog.set_parent(&owner))
 }
 
+#[cfg(target_os = "windows")]
+fn show_message(dialog: rfd::MessageDialog) -> rfd::MessageDialogResult {
+    let Some(owner) = windows::DialogOwner::new() else {
+        tracing::warn!("failed to create the native dialog owner; using an unowned dialog");
+        return dialog.show();
+    };
+    dialog.set_parent(&owner).show()
+}
+
 #[cfg(not(target_os = "windows"))]
 fn show<T>(dialog: rfd::FileDialog, open: impl FnOnce(rfd::FileDialog) -> T) -> T {
     open(dialog)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_message(dialog: rfd::MessageDialog) -> rfd::MessageDialogResult {
+    dialog.show()
 }
 
 #[cfg(target_os = "windows")]

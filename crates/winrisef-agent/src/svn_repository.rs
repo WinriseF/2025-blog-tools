@@ -14,9 +14,11 @@ use winrisef_version_control::{
 };
 
 use crate::svn_cli::{SvnCli, SvnDiffSummaryEntry, SvnError, SvnRepositoryInfo, SvnStatusEntry};
-use crate::svn_patch::{SvnPatchCache, SvnPatchSet, added_file_patch};
+use crate::svn_patch::{
+    PATCH_PREVIEW_LIMIT, SvnPatchBody, SvnPatchCache, SvnPatchParser, SvnPatchSet, added_file_patch,
+};
 
-const PREVIEW_LIMIT: usize = 2 * 1024 * 1024;
+const PREVIEW_LIMIT: usize = PATCH_PREVIEW_LIMIT;
 const EXPORT_LIMIT: usize = 32 * 1024 * 1024;
 const PREVIEW_CACHE_LIMIT: usize = 16 * 1024 * 1024;
 const PREVIEW_CACHE_MAX_ITEMS: usize = 8;
@@ -85,7 +87,7 @@ pub struct SvnDiffFile {
 #[derive(Clone)]
 pub struct SvnDiffSession {
     pub files: Vec<SvnDiffFile>,
-    patch: Arc<SvnPatchSet>,
+    patch_key: (Option<u64>, Option<u64>),
     preview_cache: Arc<Mutex<PreviewCache>>,
 }
 
@@ -295,17 +297,12 @@ impl SvnRepository {
             "SVN svn+ssh:// tunnels are disabled in the read-only bridge"
         );
         let host = repository_host(&self.info.repository_root_url);
-        let confirmed = rfd::MessageDialog::new()
-            .set_title("连接 SVN 历史")
-            .set_description(format!(
-                "将读取 SVN 历史：{host}\n\n是否允许本次会话访问网络？"
-            ))
-            .set_buttons(rfd::MessageButtons::YesNo)
-            .show();
-        anyhow::ensure!(
-            matches!(confirmed, rfd::MessageDialogResult::Yes),
-            "SVN 历史连接已取消"
+        let confirmed = crate::native_dialog::confirm(
+            "连接 SVN 历史",
+            format!("本次会话将连接 {host} 读取 SVN 历史。\n\n不会修改仓库或保存认证信息。"),
+            "允许访问",
         );
+        anyhow::ensure!(confirmed, "SVN 历史连接已取消");
         self.history_head_revision = Some(block_on(self.cli.head_revision(&self.info.root_path))?);
         self.history_connected = true;
         self.overview()
@@ -461,7 +458,7 @@ impl SvnRepository {
         }
         Ok(SvnDiffSession {
             files,
-            patch,
+            patch_key: (command_old_revision, command_new_revision),
             preview_cache: Arc::new(Mutex::new(PreviewCache::new())),
         })
     }
@@ -522,16 +519,13 @@ impl SvnRepository {
         {
             return Ok(content);
         }
-        let mut patch = session
-            .patch
-            .file(&file.path)
-            .map(|value| value.patch.clone())
-            .unwrap_or_default();
-        if patch.is_empty() && file.status == "Unversioned" {
+        let patch = if file.status == "Unversioned" {
             let bytes = self.read_working_bytes(&file.path)?;
             anyhow::ensure!(!looks_binary(&bytes), "selected SVN file is binary");
-            patch = added_file_patch(&file.path, &bytes);
-        }
+            added_file_patch(&file.path, &bytes)
+        } else {
+            self.read_patch(session, file)?
+        };
         anyhow::ensure!(
             patch.len() <= PREVIEW_LIMIT,
             "selected SVN patch is too large"
@@ -593,18 +587,70 @@ impl SvnRepository {
         {
             return Ok(patch);
         }
-        let bytes = block_on(self.cli.diff_patch(
+        let mut parser = SvnPatchParser::new(|path| normalize_path(&self.info.root_path, path));
+        block_on(self.cli.diff_patch_stream(
             &self.info.root_path,
             old_revision,
             new_revision,
+            |bytes| {
+                parser.push(bytes);
+                Ok(())
+            },
         ))?;
-        let patch = Arc::new(SvnPatchSet::parse(&bytes, |path| {
-            normalize_path(&self.info.root_path, path)
-        }));
+        let patch = Arc::new(parser.finish());
         if let Ok(mut cache) = self.patch_cache.lock() {
             cache.insert(key, Arc::clone(&patch));
         }
         Ok(patch)
+    }
+
+    fn read_patch(&self, session: &SvnDiffSession, file: &SvnDiffFile) -> anyhow::Result<String> {
+        let cached = self
+            .patch_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(&session.patch_key));
+        if let Some(body) = cached
+            .as_deref()
+            .and_then(|patch| patch.file(&file.path))
+            .map(|patch| &patch.body)
+        {
+            match body {
+                SvnPatchBody::Retained(patch) => return Ok(patch.clone()),
+                SvnPatchBody::TooLarge => anyhow::bail!("selected SVN patch is too large"),
+                SvnPatchBody::Deferred => {}
+            }
+        }
+        let peg_revision = match (&file.old_source, &file.new_source) {
+            (_, SvnContentSource::Revision(revision)) => Some(*revision),
+            (SvnContentSource::Revision(revision), SvnContentSource::Empty) => Some(*revision),
+            _ => None,
+        };
+        let bytes = match block_on(self.cli.diff_file_patch(
+            &self.info.root_path,
+            session.patch_key.0,
+            session.patch_key.1,
+            &file.path,
+            peg_revision,
+            PREVIEW_LIMIT,
+        )) {
+            Err(SvnError::OutputTooLarge) => {
+                anyhow::bail!("selected SVN patch is too large")
+            }
+            result => result?,
+        };
+        let patch = SvnPatchSet::parse(&bytes, |path| normalize_path(&self.info.root_path, path));
+        let body = patch
+            .file(&file.path)
+            .or_else(|| patch.files.values().next())
+            .map(|patch| &patch.body)
+            .context("selected SVN patch was not returned")?;
+        match body {
+            SvnPatchBody::Retained(patch) => Ok(patch.clone()),
+            SvnPatchBody::Deferred | SvnPatchBody::TooLarge => {
+                anyhow::bail!("selected SVN patch is too large")
+            }
+        }
     }
 
     fn file_from_summary(

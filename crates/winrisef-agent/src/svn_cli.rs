@@ -5,6 +5,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use quick_xml::de::from_str;
 use serde::Deserialize;
 use thiserror::Error;
@@ -15,8 +18,13 @@ use tokio::{
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
+const DIFF_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DIFF_STREAM_BYTES: usize = 512 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 512 * 1024;
+const STREAM_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 static SVN_CLI: OnceCell<SvnCli> = OnceCell::const_new();
 
 #[derive(Debug, Error)]
@@ -37,6 +45,8 @@ pub enum SvnError {
     InvalidPath,
     #[error("SVN data exceeded the allowed limit")]
     OutputTooLarge,
+    #[error("SVN diff exceeded the 512 MiB processing limit")]
+    DiffTooLarge,
     #[error("SVN I/O failed: {0}")]
     Io(#[from] io::Error),
 }
@@ -161,10 +171,7 @@ impl SvnCli {
         }))
     }
 
-    pub async fn status(
-        &self,
-        root_path: &Path,
-    ) -> Result<Vec<SvnStatusEntry>, SvnError> {
+    pub async fn status(&self, root_path: &Path) -> Result<Vec<SvnStatusEntry>, SvnError> {
         let output = self
             .run_owned_in(
                 vec![
@@ -198,10 +205,7 @@ impl SvnCli {
             .collect())
     }
 
-    pub async fn head_revision(
-        &self,
-        root_path: &Path,
-    ) -> Result<u64, SvnError> {
+    pub async fn head_revision(&self, root_path: &Path) -> Result<u64, SvnError> {
         let output = self
             .run_owned_in(
                 vec![
@@ -241,9 +245,7 @@ impl SvnCli {
             format!("{start_revision}:1"),
             ".".to_owned(),
         ];
-        let output = self
-            .run_owned_in(args, root_path, MAX_STDOUT_BYTES)
-            .await?;
+        let output = self.run_owned_in(args, root_path, MAX_STDOUT_BYTES).await?;
         let document: LogDocument = parse_xml(&output)?;
         Ok(document
             .entries
@@ -293,9 +295,7 @@ impl SvnCli {
             });
         }
         args.push(".".to_owned());
-        let output = self
-            .run_owned_in(args, root_path, MAX_STDOUT_BYTES)
-            .await?;
+        let output = self.run_owned_in(args, root_path, MAX_STDOUT_BYTES).await?;
         let document: DiffDocument = parse_xml(&output)?;
         Ok(document
             .paths
@@ -311,22 +311,34 @@ impl SvnCli {
             .collect())
     }
 
-    pub async fn diff_patch(
+    pub async fn diff_patch_stream(
         &self,
         root_path: &Path,
         old_revision: Option<u64>,
         new_revision: Option<u64>,
-    ) -> Result<Vec<u8>, SvnError> {
-        let mut args = vec!["diff".to_owned(), "--git".to_owned()];
-        if let Some(old_revision) = old_revision {
-            args.push("-r".to_owned());
-            args.push(match new_revision {
-                Some(new_revision) => format!("{old_revision}:{new_revision}"),
-                None => old_revision.to_string(),
-            });
-        }
+        on_chunk: impl FnMut(&[u8]) -> Result<(), SvnError>,
+    ) -> Result<(), SvnError> {
+        let mut args = diff_patch_args(old_revision, new_revision);
         args.push(".".to_owned());
-        self.run_owned_in(args, root_path, MAX_STDOUT_BYTES).await
+        let mut command = self.command();
+        command.args(args);
+        run_streaming_command(command, root_path, on_chunk).await
+    }
+
+    pub async fn diff_file_patch(
+        &self,
+        root_path: &Path,
+        old_revision: Option<u64>,
+        new_revision: Option<u64>,
+        target: &str,
+        peg_revision: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<u8>, SvnError> {
+        let mut args = diff_patch_args(old_revision, new_revision);
+        args.push("--".to_owned());
+        args.push(relative_target_at(target, peg_revision)?);
+        self.run_owned_in(args, root_path, limit.min(MAX_STDOUT_BYTES))
+            .await
     }
 
     async fn run_owned_in(
@@ -354,8 +366,22 @@ impl SvnCli {
     fn command(&self) -> Command {
         let mut command = Command::new(&self.path);
         command.args(["--non-interactive", "--no-auth-cache"]);
+        #[cfg(windows)]
+        command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
         command
     }
+}
+
+fn diff_patch_args(old_revision: Option<u64>, new_revision: Option<u64>) -> Vec<String> {
+    let mut args = vec!["diff".to_owned(), "--git".to_owned()];
+    if let Some(old_revision) = old_revision {
+        args.push("-r".to_owned());
+        args.push(match new_revision {
+            Some(new_revision) => format!("{old_revision}:{new_revision}"),
+            None => old_revision.to_string(),
+        });
+    }
+    args
 }
 
 async fn run_command(
@@ -407,6 +433,53 @@ async fn run_command(
     Ok(stdout)
 }
 
+async fn run_streaming_command(
+    mut command: Command,
+    current_dir: &Path,
+    on_chunk: impl FnMut(&[u8]) -> Result<(), SvnError>,
+) -> Result<(), SvnError> {
+    command
+        .current_dir(current_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing SVN stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing SVN stderr"))?;
+    let result = tokio::time::timeout(DIFF_COMMAND_TIMEOUT, async {
+        tokio::try_join!(
+            async { child.wait().await.map_err(SvnError::Io) },
+            read_streamed(stdout, MAX_DIFF_STREAM_BYTES, on_chunk),
+            read_limited(stderr, MAX_STDERR_BYTES),
+        )
+    })
+    .await;
+    let (status, (), stderr) = match result {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            terminate(&mut child).await;
+            return Err(error);
+        }
+        Err(_) => {
+            terminate(&mut child).await;
+            return Err(SvnError::Timeout);
+        }
+    };
+    if !status.success() {
+        return Err(SvnError::CommandFailed {
+            message: command_error_message(&stderr),
+        });
+    }
+    Ok(())
+}
+
 async fn terminate(child: &mut Child) {
     let _ = child.kill().await;
 }
@@ -424,6 +497,10 @@ fn canonical_existing_path(path: &Path) -> Result<PathBuf, SvnError> {
 }
 
 fn relative_target(value: &str) -> Result<String, SvnError> {
+    relative_target_at(value, None)
+}
+
+fn relative_target_at(value: &str, peg_revision: Option<u64>) -> Result<String, SvnError> {
     if value.is_empty() || value.contains('\0') || value.contains('\n') || value.contains('\r') {
         return Err(SvnError::InvalidPath);
     }
@@ -445,7 +522,10 @@ fn relative_target(value: &str) -> Result<String, SvnError> {
     {
         return Err(SvnError::InvalidPath);
     }
-    Ok(format!("{target}@"))
+    Ok(match peg_revision {
+        Some(revision) => format!("{target}@{revision}"),
+        None => format!("{target}@"),
+    })
 }
 
 fn normalize_props(value: &str) -> String {
@@ -489,6 +569,26 @@ async fn read_limited<R: AsyncRead + Unpin>(
             return Err(SvnError::OutputTooLarge);
         }
         result.extend_from_slice(&buffer[..count]);
+    }
+}
+
+async fn read_streamed<R: AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+    mut on_chunk: impl FnMut(&[u8]) -> Result<(), SvnError>,
+) -> Result<(), SvnError> {
+    let mut total = 0_usize;
+    let mut buffer = [0_u8; STREAM_BUFFER_BYTES];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        total = total.checked_add(count).ok_or(SvnError::DiffTooLarge)?;
+        if total > limit {
+            return Err(SvnError::DiffTooLarge);
+        }
+        on_chunk(&buffer[..count])?;
     }
 }
 
@@ -599,11 +699,15 @@ struct DiffPath {
 
 #[cfg(test)]
 mod tests {
-    use super::{SvnError, read_limited, relative_target};
+    use super::{SvnError, read_limited, read_streamed, relative_target, relative_target_at};
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn escapes_relative_svn_targets_and_rejects_traversal() {
-        assert_eq!(relative_target("folder/file@name.txt").unwrap(), "folder/file@name.txt@");
+        assert_eq!(
+            relative_target("folder/file@name.txt").unwrap(),
+            "folder/file@name.txt@"
+        );
         let platform_path = relative_target("folder\\file.txt").unwrap();
         assert_eq!(
             platform_path,
@@ -615,6 +719,10 @@ mod tests {
         );
         assert!(relative_target("../outside.txt").is_err());
         assert!(relative_target("/outside.txt").is_err());
+        assert_eq!(
+            relative_target_at("folder/file@name.txt", Some(42)).unwrap(),
+            "folder/file@name.txt@42"
+        );
     }
 
     #[tokio::test]
@@ -624,5 +732,37 @@ mod tests {
             read_limited(&b"1234"[..], 3).await,
             Err(SvnError::OutputTooLarge)
         ));
+    }
+
+    #[tokio::test]
+    async fn streams_without_retaining_the_complete_command_output() {
+        let mut streamed = Vec::new();
+        read_streamed(&b"1234"[..], 4, |chunk| {
+            streamed.extend_from_slice(chunk);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(streamed, b"1234");
+        assert!(matches!(
+            read_streamed(&b"1234"[..], 3, |_| Ok(())).await,
+            Err(SvnError::DiffTooLarge)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepts_streams_larger_than_the_previous_sixteen_mib_limit() {
+        let expected = 17 * 1024 * 1024;
+        let reader = tokio::io::repeat(b'x').take(expected as u64);
+        let mut received = 0;
+
+        read_streamed(reader, super::MAX_DIFF_STREAM_BYTES, |chunk| {
+            received += chunk.len();
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(received, expected);
     }
 }

@@ -1,6 +1,7 @@
 #include <windows.h>
 
 1 ICON "assets/branding/winrisef-toolbox-agent.ico"
+1 RT_MANIFEST "assets/windows/winrisef-toolbox-agent.manifest"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION 0,1,0,1
