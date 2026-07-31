@@ -11,6 +11,7 @@ pub struct SvnPatchFile {
     pub patch: String,
     pub additions: usize,
     pub deletions: usize,
+    pub is_binary: bool,
 }
 
 #[derive(Debug)]
@@ -27,6 +28,7 @@ impl SvnPatchSet {
         let mut current_patch = String::new();
         let mut additions = 0;
         let mut deletions = 0;
+        let mut is_binary = false;
         let mut in_hunk = false;
 
         for segment in text.split_inclusive('\n') {
@@ -38,10 +40,12 @@ impl SvnPatchSet {
                     std::mem::take(&mut current_patch),
                     additions,
                     deletions,
+                    is_binary,
                 );
                 current_path = Some(normalize(path));
                 additions = 0;
                 deletions = 0;
+                is_binary = false;
                 in_hunk = false;
             }
             if current_path.is_some() {
@@ -58,6 +62,14 @@ impl SvnPatchSet {
                     deletions += 1;
                 }
             }
+            if line.contains('\0')
+                || line.starts_with("Cannot display:")
+                || line
+                    .strip_prefix("svn:mime-type = ")
+                    .is_some_and(|mime| !mime.trim().starts_with("text/"))
+            {
+                is_binary = true;
+            }
         }
         finish_file(
             &mut files,
@@ -65,6 +77,7 @@ impl SvnPatchSet {
             current_patch,
             additions,
             deletions,
+            is_binary,
         );
         let bytes = files.values().map(|file| file.patch.len()).sum();
         Self { files, bytes }
@@ -81,6 +94,7 @@ fn finish_file(
     patch: String,
     additions: usize,
     deletions: usize,
+    is_binary: bool,
 ) {
     if let Some(path) = path {
         files.insert(
@@ -89,6 +103,7 @@ fn finish_file(
                 patch,
                 additions,
                 deletions,
+                is_binary,
             },
         );
     }
@@ -96,14 +111,11 @@ fn finish_file(
 
 pub fn added_file_patch(path: &str, bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes).replace("\r\n", "\n");
-    let lines = if text.is_empty() {
-        0
-    } else {
-        text.lines().count()
-    };
-    let mut patch = format!(
-        "Index: {path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{lines} @@\n"
-    );
+    let mut patch = format!("Index: {path}\n--- /dev/null\n+++ b/{path}\n");
+    if text.is_empty() {
+        return patch;
+    }
+    patch.push_str(&format!("@@ -0,0 +1,{} @@\n", text.lines().count()));
     for line in text.split_inclusive('\n') {
         patch.push('+');
         patch.push_str(line);
@@ -113,39 +125,6 @@ pub fn added_file_patch(path: &str, bytes: &[u8]) -> String {
         patch.push_str("\\ No newline at end of file\n");
     }
     patch
-}
-
-pub fn reverse_patch(patch: &str) -> String {
-    let mut output = String::with_capacity(patch.len());
-    let mut in_hunk = false;
-    for segment in patch.split_inclusive('\n') {
-        let line = segment.trim_end_matches(['\r', '\n']);
-        let ending = &segment[line.len()..];
-        if let Some(header) = reverse_hunk_header(line) {
-            in_hunk = true;
-            output.push_str(&header);
-            output.push_str(ending);
-        } else if line.starts_with("Property changes on:") {
-            in_hunk = false;
-            output.push_str(segment);
-        } else if in_hunk && line.starts_with('+') {
-            output.push('-');
-            output.push_str(&segment[1..]);
-        } else if in_hunk && line.starts_with('-') {
-            output.push('+');
-            output.push_str(&segment[1..]);
-        } else {
-            output.push_str(segment);
-        }
-    }
-    output
-}
-
-fn reverse_hunk_header(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("@@ -")?;
-    let (old, rest) = rest.split_once(" +")?;
-    let (new, suffix) = rest.split_once(" @@")?;
-    Some(format!("@@ -{new} +{old} @@{suffix}"))
 }
 
 pub struct SvnPatchCache {
@@ -211,7 +190,7 @@ impl SvnPatchCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{SvnPatchCache, SvnPatchSet, added_file_patch, reverse_patch};
+    use super::{SvnPatchCache, SvnPatchSet, added_file_patch};
     use std::sync::Arc;
 
     #[test]
@@ -222,7 +201,24 @@ mod tests {
         let file = patch.file("src/main.rs").unwrap();
 
         assert_eq!((file.additions, file.deletions), (2, 1));
+        assert!(!file.is_binary);
         assert!(file.patch.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn detects_svn_binary_patch_metadata() {
+        let patch = SvnPatchSet::parse(
+            b"Index: image.png\nCannot display: file marked as a binary type.\nsvn:mime-type = image/png\n",
+            str::to_owned,
+        );
+
+        assert!(patch.file("image.png").unwrap().is_binary);
+
+        let nul_patch = SvnPatchSet::parse(
+            b"Index: raw.dat\n@@ -1 +1 @@\n-old\n+new\0value\n",
+            str::to_owned,
+        );
+        assert!(nul_patch.file("raw.dat").unwrap().is_binary);
     }
 
     #[test]
@@ -241,11 +237,9 @@ mod tests {
     }
 
     #[test]
-    fn creates_added_patch_and_reverses_hunks() {
+    fn creates_added_patch() {
         let added = added_file_patch("new.txt", b"one\ntwo");
         assert!(added.contains("@@ -0,0 +1,2 @@\n+one\n+two\n"));
-
-        let reversed = reverse_patch("@@ -2,2 +4,3 @@ label\n-old\n+new\n keep\n");
-        assert_eq!(reversed, "@@ -4,3 +2,2 @@ label\n+old\n-new\n keep\n");
+        assert!(!added_file_patch("empty.txt", b"").contains("@@"));
     }
 }

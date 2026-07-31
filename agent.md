@@ -489,11 +489,11 @@ unbounded channel
 
 Agent 支持 `winrisef://launch?...&feature=version-control`。该模式与 transfer 共用单实例互斥，但只绑定 `127.0.0.1` WebTransport 与 `/winrisef/version-control/v2`，不初始化 LAN HTTP、文件传输、地址发现或防火墙授权。重复启动通过回调返回稳定的 `agent_busy`。
 
-`crates/winrisef-version-control` 继续作为独立 Git 读取内核，使用仅启用本地能力的 vendored `git2/libgit2`，不启用 SSH/HTTPS/OpenSSL，也不依赖 `git.exe`。SVN 由 Agent 的 `svn_cli`/`svn_repository` 适配器调用系统 `svn.exe`，不读取 `.svn/wc.db`、不经过 shell，并固定 `--non-interactive --no-auth-cache` 与输出上限。网页只能以 Agent 生成的 repository/diff/file/export ID 调用；目录和保存目标只由 `rfd` 系统对话框产生。控制帧维持 64KiB 并按序列化预算分页，源码预览走独立单向流。目录同时包含 Git 和 SVN 时，Agent 返回候选 ID，网页必须显式选择后才打开。
+`crates/winrisef-version-control` 继续作为独立 Git 读取内核，使用仅启用本地能力的 vendored `git2/libgit2`，不启用 SSH/HTTPS/OpenSSL，也不依赖 `git.exe`。SVN 由 Agent 的 `svn_cli`/`svn_repository` 适配器调用系统 `svn.exe`，不读取 `.svn/wc.db`、不经过 shell，并固定 `--non-interactive --no-auth-cache`；stdout/stderr 并发排空，45 秒超时和逐流输出上限会直接终止子进程。网页只能以 Agent 生成的 repository/diff/file/export ID 调用；目录和保存目标只由 `rfd` 系统对话框产生。控制帧维持 64KiB 并按序列化预算分页，源码预览走独立单向流。目录同时包含 Git 和 SVN 时，Agent 返回候选 ID，网页必须显式选择后才打开。
 
 只读范围包含历史、HEAD/本地与已有远程引用、标签、stash、HEAD reflog 删除分支提示、工作区与冲突 stage。禁止 checkout/switch、fetch/pull/push、stage、commit、restore/reset 和 stash 写操作。导出是唯一写入例外：系统保存框、仓库内二次确认、同目录临时文件、sync 与原子完成，失败、取消或 Bridge 会话退出时清理临时文件。
 
-Git V2 支持普通仓库、linked worktree、bare 和 gitlink；SVN V2 支持工作副本检测、状态、混合版本提示、显式确认后的线性历史和只读文本差异预览。SVN 每次 Diff 只运行一次 `svn diff --git`，按文件缓存 Patch 与行数；默认“仅变更”预览不再执行 `svn cat`，完整文件模式才并行读取两侧源码。Patch 按原始字节宽容解码，单个非 UTF-8 文件不会中断整个工作区。SVN 不提供 staging、远程写操作或导出。完整源码预览每侧 2MiB，Git 导出每侧 32MiB。日志不得记录源码、diff、token 或绝对路径。
+Git V2 支持普通仓库、linked worktree、bare 和 gitlink；SVN V2 支持工作副本检测、状态、混合版本提示、显式确认后的线性历史和只读文本差异预览。SVN revision 使用强类型入口：`empty` 映射 r0、commit 必须为十进制 `r<N>`，working tree 只允许位于右侧。工作区 Diff 同时用 status 补充未跟踪/冲突信息、用 summarize 保留删除目录等权威节点类型；每次 Diff 只运行一次 `svn diff --git`，按文件缓存 Patch、行数和二进制元数据。默认“仅变更”预览不执行 `svn cat`，完整文件模式才并行读取两侧源码。Patch 与完整源码均宽容替换非 UTF-8 字节；二进制/NUL 文件仍拒绝文本预览。SVN 不提供 staging、远程写操作或导出。完整源码预览每侧 2MiB，Git 导出每侧 32MiB。日志不得记录源码、diff、token 或绝对路径。
 
 ## 19. Definition of Done
 

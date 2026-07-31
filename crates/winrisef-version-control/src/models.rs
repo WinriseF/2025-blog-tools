@@ -158,6 +158,10 @@ impl DiffSession {
         self.records.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
     pub fn files(&self) -> impl ExactSizeIterator<Item = &DiffFile> {
         self.records.iter().map(|record| &record.public)
     }

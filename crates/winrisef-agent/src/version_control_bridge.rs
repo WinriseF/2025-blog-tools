@@ -392,7 +392,9 @@ impl VersionControlManager {
         let repository = self.ensure_repository_mut(&mut state, repository_id)?;
         let diff = match &repository.backend {
             RepositoryBackend::Git(reader) => DiffState::Git(Arc::new(reader.create_diff(old, new, group)?)),
-            RepositoryBackend::Svn(svn) => DiffState::Svn(Arc::new(svn.open_diff(&serde_json::to_value(&old)?, &serde_json::to_value(&new)?, group)?)),
+            RepositoryBackend::Svn(svn) => {
+                DiffState::Svn(Arc::new(svn.open_diff(&old, &new, group)?))
+            }
         };
         let id = random_id()?;
         let (summary, total_files) = diff_summary(&diff);

@@ -1,7 +1,8 @@
 use super::{
-    SOURCE_CACHE_MAX_ITEMS, SVN_HISTORY_FETCH_LIMIT, SourceCache, svn_history_has_more,
-    svn_history_page_limit, text_line_count,
+    SOURCE_CACHE_MAX_ITEMS, SVN_HISTORY_FETCH_LIMIT, SourceCache, SvnRevision, looks_binary,
+    svn_history_has_more, svn_history_page_limit, svn_revision,
 };
+use winrisef_version_control::RevisionRef;
 
 #[test]
 fn svn_history_reserves_one_fetched_entry_for_has_more() {
@@ -30,9 +31,34 @@ fn source_cache_is_bounded_and_refresh_keeps_immutable_revisions() {
 }
 
 #[test]
-fn counts_untracked_text_lines_like_an_added_file() {
-    assert_eq!(text_line_count(b""), 0);
-    assert_eq!(text_line_count(b"one"), 1);
-    assert_eq!(text_line_count(b"one\ntwo\n"), 2);
-    assert_eq!(text_line_count(b"one\ntwo"), 2);
+fn validates_and_normalizes_svn_revisions() {
+    assert_eq!(
+        svn_revision(&RevisionRef::Empty).unwrap(),
+        SvnRevision::Number(0)
+    );
+    assert_eq!(
+        svn_revision(&RevisionRef::Commit {
+            oid: "r42".to_owned()
+        })
+        .unwrap(),
+        SvnRevision::Number(42)
+    );
+    assert_eq!(
+        svn_revision(&RevisionRef::WorkingTree).unwrap(),
+        SvnRevision::Working
+    );
+    assert!(
+        svn_revision(&RevisionRef::Commit {
+            oid: "42".to_owned()
+        })
+        .is_err()
+    );
+    assert!(svn_revision(&RevisionRef::Index).is_err());
+}
+
+#[test]
+fn detects_binary_content_without_rejecting_lossy_text() {
+    assert!(looks_binary(b"text\0binary"));
+    assert!(!looks_binary("中文".as_bytes()));
+    assert!(!looks_binary(&[0xff]));
 }
