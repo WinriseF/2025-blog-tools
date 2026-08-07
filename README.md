@@ -61,7 +61,7 @@ cargo build -p winrisef-agent
 .\target\debug\winrisef-agent.exe
 ```
 
-开发版 Agent 默认信任正式站点 `https://e.winrisef.top` 与本机 loopback Origin。若两台设备通过其他 HTTPS 测试 Origin（例如局域网开发证书或预览域名）打开网页，注册时必须把这个**精确 Origin**写入 handler，且不要带末尾 `/`：
+开发版 Agent 默认信任正式站点 `https://e.winrisef.top`、`https://n.winrisef.top`、`https://v.winrisef.top` 与本机 loopback Origin。若两台设备通过其他 HTTPS 测试 Origin（例如局域网开发证书或预览域名）打开网页，注册时必须把这个**精确 Origin**写入 handler，且不要带末尾 `/`：
 
 ```powershell
 .\target\debug\winrisef-agent.exe register-protocol --trusted-origin https://192.168.1.10:3000

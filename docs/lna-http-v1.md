@@ -4,7 +4,7 @@
 
 传输：明文 HTTP/1.1 over TCP（局域网）
 
-正式 Origin：`https://e.winrisef.top`
+正式 Origin：`https://e.winrisef.top`、`https://n.winrisef.top`、`https://v.winrisef.top`
 Base path：`/winrisef/lna/v1`
 
 ## 1. 能力与回退

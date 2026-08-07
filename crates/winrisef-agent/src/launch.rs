@@ -18,7 +18,11 @@ use crate::{
 };
 
 const LAUNCH_TTL: Duration = Duration::from_secs(120);
-const PRODUCTION_WEB_ORIGINS: [&str; 1] = ["https://e.winrisef.top"];
+const PRODUCTION_WEB_ORIGINS: [&str; 3] = [
+    "https://e.winrisef.top",
+    "https://n.winrisef.top",
+    "https://v.winrisef.top",
+];
 
 struct Activation {
     return_url: Url,
@@ -361,6 +365,42 @@ fn endpoint(ip: IpAddr, port: u16, path: &str) -> String {
     match ip {
         IpAddr::V4(ip) => format!("https://{ip}:{port}{path}"),
         IpAddr::V6(ip) => format!("https://[{ip}]:{port}{path}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PRODUCTION_WEB_ORIGINS, parse_activation};
+    use url::Url;
+
+    fn activation_uri(return_url: &str) -> String {
+        let mut activation = Url::parse("winrisef://launch").expect("valid launch URL");
+        activation
+            .query_pairs_mut()
+            .append_pair("returnUrl", return_url)
+            .append_pair("nonce", "0123456789abcdef0123456789abcdef");
+        activation.into()
+    }
+
+    #[test]
+    fn production_origins_are_trusted_for_callbacks() {
+        for origin in PRODUCTION_WEB_ORIGINS {
+            let callback = format!("{origin}/t");
+            let activation = parse_activation(&activation_uri(&callback), &[])
+                .expect("production callback should be trusted");
+            assert_eq!(activation.allowed_origin, origin);
+        }
+    }
+
+    #[test]
+    fn production_origin_matching_is_exact() {
+        for callback in [
+            "http://n.winrisef.top/t",
+            "https://other.n.winrisef.top/t",
+            "https://v.winrisef.top.example.com/t",
+        ] {
+            assert!(parse_activation(&activation_uri(callback), &[]).is_err());
+        }
     }
 }
 
