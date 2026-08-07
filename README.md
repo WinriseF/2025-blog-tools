@@ -49,7 +49,7 @@ QUIC congestion       = BBR，1 MiB initial cwnd，10 ms initial RTT
 正式用户只需要下载单个 `winrisef-agent.exe` 并双击一次。无参数启动会：
 
 1. 将当前 EXE 路径注册为当前用户的 `winrisef://` handler，不要求管理员权限；
-2. 打开 `https://e.winrisef.top/t?agent-ready=1`，由网页提示“极速组件已准备完成”；
+2. 打开 `https://e.winrisef.top/toolbox/agent?agent-ready=1`，由本机能力中心显示注册结果与可用功能；
 3. 立即退出，不驻留、不创建服务，也不加入开机启动。
 
 以后用户只需打开网页并开启“极速模式”，浏览器便会按需唤起 Agent。如果 EXE 被移动或重命名，再双击一次新位置的 EXE 即可覆盖并修复注册路径。删除 EXE 前可通过开发命令撤销注册；正式下载页后续应提供同样的卸载说明。

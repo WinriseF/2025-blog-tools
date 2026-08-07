@@ -2,8 +2,8 @@ use anyhow::Context;
 
 use crate::{cli::RegisterProtocolArgs, protocol_registration};
 
-const READY_URL: &str = "https://e.winrisef.top/t?agent-ready=1";
-const FAILED_URL: &str = "https://e.winrisef.top/t?agent-ready=0";
+const READY_URL: &str = "https://e.winrisef.top/toolbox/agent?agent-ready=1";
+const FAILED_URL: &str = "https://e.winrisef.top/toolbox/agent?agent-ready=0";
 
 pub fn run() -> anyhow::Result<()> {
     tracing::info!(

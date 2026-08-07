@@ -9,6 +9,7 @@
 - 可执行文件：`WinriseF-Toolbox-Agent.exe`
 - 内部二进制名：`winrisef-agent`
 - 协议 Scheme：`winrisef://`
+- 网页能力中心：`https://e.winrisef.top/toolbox/agent`
 
 Agent 是 Toolbox 与电脑之间的便携本机能力接口。当前提供局域网互传的极速模式，以及 Git/SVN 只读版本控制工作台；未来可在不改变产品名的前提下增加其他受控本机能力。
 
